@@ -35,6 +35,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 import time
+import tempfile
+import errno
 
 try:
     from PIL import Image, UnidentifiedImageError
@@ -137,25 +139,32 @@ def get_photo_date(path: Path) -> tuple[Optional[datetime], str]:
 
     # ── EXIF ──────────────────────────────────────────
     try:
-        img = Image.open(path)
-        exif_bytes = img.info.get("exif")
-        if exif_bytes:
-            exif = piexif.load(exif_bytes)
-            exif_map = [
-                (piexif.ExifIFD.DateTimeOriginal,  exif.get("Exif", {}), "EXIF:DateTimeOriginal"),
-                (piexif.ExifIFD.DateTimeDigitized, exif.get("Exif", {}), "EXIF:DateTimeDigitized"),
-                (piexif.ImageIFD.DateTime,          exif.get("0th",  {}), "EXIF:DateTime"),
-            ]
-            for tag, ifd, label in exif_map:
-                raw = ifd.get(tag)
-                if raw:
-                    val = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw)
-                    candidate = parse_exif_date(val)
-                    if candidate and not is_date_suspicious(candidate):
-                        return candidate, label
-                    elif candidate and dt is None:
-                        dt, source = candidate, label  # store even if suspicious
+        with Image.open(path) as img:
+            exif_bytes = img.info.get("exif")
+            if exif_bytes:
+                try:
+                    exif = piexif.load(exif_bytes)
+                except Exception:
+                    exif = {}
+                exif_map = [
+                    (piexif.ExifIFD.DateTimeOriginal,  exif.get("Exif", {}), "EXIF:DateTimeOriginal"),
+                    (piexif.ExifIFD.DateTimeDigitized, exif.get("Exif", {}), "EXIF:DateTimeDigitized"),
+                    (piexif.ImageIFD.DateTime,          exif.get("0th",  {}), "EXIF:DateTime"),
+                ]
+                for tag, ifd, label in exif_map:
+                    raw = ifd.get(tag)
+                    if raw:
+                        val = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw)
+                        candidate = parse_exif_date(val)
+                        if candidate and not is_date_suspicious(candidate):
+                            return candidate, label
+                        elif candidate and dt is None:
+                            dt, source = candidate, label  # store even if suspicious
+    except UnidentifiedImageError:
+        # Not an image we can open — fall through to other strategies
+        pass
     except Exception:
+        # Be conservative: don't let EXIF parsing crash the run
         pass
 
     # ── Filename ──────────────────────────────────────
@@ -201,6 +210,53 @@ def compute_perceptual_hash(path: Path) -> Optional[imagehash.ImageHash]:
             return imagehash.phash(img, hash_size=16)  # larger = more precise
     except Exception:
         return None
+
+
+def safe_copy(src: Path, candidate: Path) -> Optional[Path]:
+    """
+    Safely copy `src` to `candidate` without overwriting existing files.
+    This function attempts to create the destination file using O_EXCL to
+    guarantee we never overwrite an existing file. If the candidate exists,
+    it will append _1, _2, ... to the stem until an unused name is found.
+    Returns the path of the copied file, or None on error.
+    """
+    dest_dir = candidate.parent
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+
+    stem = candidate.stem
+    suffix = candidate.suffix
+    counter = 0
+    while True:
+        if counter == 0:
+            target = dest_dir / f"{stem}{suffix}"
+        else:
+            target = dest_dir / f"{stem}_{counter}{suffix}"
+        try:
+            # Use low-level os.open with O_EXCL to ensure we don't overwrite
+            fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            counter += 1
+            continue
+        except OSError as e:
+            return None
+        try:
+            with os.fdopen(fd, 'wb') as out_f, open(src, 'rb') as in_f:
+                shutil.copyfileobj(in_f, out_f, length=65536)
+            # Try to copy metadata; failures here are non-fatal
+            try:
+                shutil.copystat(str(src), str(target))
+            except Exception:
+                pass
+            return target
+        except Exception:
+            try:
+                target.unlink()
+            except Exception:
+                pass
+            return None
 
 
 def process_photo(path: Path) -> dict:
@@ -338,15 +394,8 @@ def destination_path(photo: dict, output_root: Path) -> Path:
     else:
         folder = output_root / "organized" / "unknown_date"
 
-    # Avoid filename collisions
-    dest = folder / original.name
-    if dest.exists():
-        stem, suffix = original.stem, original.suffix
-        counter = 1
-        while dest.exists():
-            dest = folder / f"{stem}_{counter}{suffix}"
-            counter += 1
-    return dest
+    # Return base destination (unique name guaranteed by safe_copy at write time)
+    return folder / original.name
 
 # ── Report Generation ──────────────────────────────────────────────────────────
 
@@ -442,7 +491,16 @@ Duplicates → <code>{output_root / "duplicates"}</code></p>
     html += "</body></html>"
 
     output_root.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(html, encoding="utf-8")
+    # Write report atomically to avoid partial files
+    tmp_path = output_root / (report_path.name + ".tmp")
+    try:
+        tmp_path.write_text(html, encoding="utf-8")
+        os.replace(str(tmp_path), str(report_path))
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
     return report_path
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -513,24 +571,21 @@ def main():
             continue
 
         if photo["path"] in dup_paths:
-            # Move to duplicates folder
-            dest = dup_root / path.name
+            candidate = dup_root / path.name
             if not args.dry_run:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                # Avoid collision
-                if dest.exists():
-                    stem, suffix = path.stem, path.suffix
-                    c = 1
-                    while dest.exists():
-                        dest = dup_root / f"{stem}_{c}{suffix}"
-                        c += 1
-                shutil.copy2(str(path), str(dest))
+                copied = safe_copy(path, candidate)
+                if not copied:
+                    errors.append({"path": photo["path"], "error": "Failed to copy duplicate"})
         else:
-            dest = destination_path(photo, output)
+            candidate = destination_path(photo, output)
             if not args.dry_run:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(path), str(dest))
-            organized_count += 1
+                copied = safe_copy(path, candidate)
+                if copied:
+                    organized_count += 1
+                else:
+                    errors.append({"path": photo["path"], "error": "Failed to copy organized photo"})
+            else:
+                organized_count += 1
 
     elapsed = time.time() - start_time
 
