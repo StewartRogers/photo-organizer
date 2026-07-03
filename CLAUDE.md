@@ -8,14 +8,17 @@ HTML report at the end.
 
 ## Layout
 
-- `photo_organizer.py` — the tool (~470 lines). Photos are passed around as a
+- `photo_organizer.py` — the tool (~700 lines). Photos are passed around as a
   `PhotoRecord` dataclass (`path`, `size`, `date`, `date_source`, `file_hash`,
   `phash`, `error`); pipeline results use an `OrganizeResults` dataclass.
 - `tests/test_photo_organizer.py` — pytest suite covering date parsing,
   `find_duplicates` grouping, `safe_copy` collision/overwrite handling, symlink
   skipping in `scan_photos`, and `validate_paths`.
-- No build/lint config — plain `python3 photo_organizer.py ...`; tests via
-  `pytest tests/` (needs `pip install pytest` plus the tool's own deps).
+- `requirements.txt` / `requirements-dev.txt` — runtime deps (Pillow, piexif,
+  imagehash, tqdm, colorama, pillow-heif) and dev deps (adds pytest),
+  respectively. No other build/lint config — plain `python3 photo_organizer.py
+  ...`; tests via `pytest tests/` (`pip install -r requirements-dev.txt`
+  first).
 
 ## Key functions
 
@@ -61,7 +64,10 @@ HTML report at the end.
   something to "fix" reflexively.
 - `find_duplicates`'s visual clustering is still O(n²); the warning threshold is
   a stopgap, not an algorithmic fix — revisit if runs on >50k-photo libraries
-  become common.
+  become common. Measured (2026-07-03, isolated benchmark of the comparison
+  loop, not full pipeline): 500 photos → 1.6s, 2,000 → 27.9s, 10,000 → 633.6s
+  (~10.6 min) — a near-exact n² fit. Extrapolates to ~43 min at 20k and several
+  hours at 50k. This step doesn't parallelize with `--workers`.
 
 ## Conventions to preserve
 

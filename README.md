@@ -37,13 +37,11 @@ Download from: https://www.python.org/downloads/
 Open Command Prompt and run:
 
 ```
-pip install Pillow piexif imagehash tqdm colorama
+pip install -r requirements.txt
 ```
 
-**For iPhone HEIC photos (optional but recommended):**
-```
-pip install pillow-heif
-```
+This installs Pillow, piexif, imagehash, tqdm, colorama, and pillow-heif (needed
+for iPhone HEIC photos — without it, HEIC files are scanned but skipped).
 
 ---
 
@@ -119,7 +117,7 @@ The HTML report (open in any browser) contains:
 ## Running Tests
 
 ```
-pip install pytest
+pip install -r requirements-dev.txt
 pytest tests/
 ```
 
@@ -134,8 +132,13 @@ JPG, JPEG, PNG, GIF, BMP, TIFF, WebP, HEIC/HEIF (with pillow-heif), and RAW form
 ## Tips for 10,000+ Photos
 
 - **Run `--dry-run` first** — always. The report will show you suspicious dates before anything moves.
-- **Use `--workers 8`** on a modern machine to speed up the hashing phase.
-- The hashing phase (visual similarity) is the slowest step — expect 1–3 hours for 50k photos on a typical machine.
+- **Use `--workers 8`** on a modern machine to speed up date/hash extraction — note
+  this does **not** speed up the visual-duplicate comparison step below, which is
+  single-threaded.
+- The visual-duplicate comparison step is O(n²) and is the slowest part of a run.
+  Measured on real hardware: ~1.6s at 500 photos, ~28s at 2,000, ~10.5 min at
+  10,000. At 50k photos, expect **several hours**, not 1–3 — budget accordingly
+  and prefer to run this unattended.
 - After running, review the `duplicates/` folder before deleting anything. The script never deletes files.
 - Photos with suspicious dates land in `organized/unknown_date/` — you can manually sort those.
 
