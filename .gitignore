@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Tool output (photo_organizer.py writes here by default when run in-repo)
+output/
+organized/
+duplicates/
+photo_organizer_report.html
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store

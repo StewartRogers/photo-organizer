@@ -27,16 +27,14 @@ import sys
 import shutil
 import hashlib
 import argparse
-import json
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 import time
-import tempfile
-import errno
 
 try:
     from PIL import Image, UnidentifiedImageError
@@ -70,6 +68,40 @@ SUPPORTED_EXTENSIONS = {
 # Suspicious year range — flag dates outside this as potentially wrong
 MIN_VALID_YEAR = 1990
 MAX_VALID_YEAR = datetime.now().year + 1
+
+FILE_READ_CHUNK_SIZE = 65536  # bytes per chunk when hashing/copying files
+
+# Perceptual-hash clustering in find_duplicates() is O(n^2). Above this many
+# candidates it can take a very long time; we warn (but still proceed) so
+# large libraries don't appear to hang silently.
+VISUAL_DEDUP_WARN_THRESHOLD = 50_000
+
+REPORT_MAX_SUSPICIOUS_ROWS = 500
+REPORT_MAX_ERROR_ROWS = 200
+REPORT_MAX_DUP_GROUP_ROWS = 100
+
+# ── Data model ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class PhotoRecord:
+    """All metadata collected for a single photo."""
+    path: str
+    size: int = 0
+    date: Optional[datetime] = None
+    date_source: str = "error"
+    file_hash: Optional[str] = None
+    phash: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class OrganizeResults:
+    total: int
+    organized: int
+    duplicates: int
+    errors: list = field(default_factory=list)
+    suspicious_dates: list = field(default_factory=list)
+    dup_groups: dict = field(default_factory=dict)
 
 # ── Date Extraction ────────────────────────────────────────────────────────────
 
@@ -197,7 +229,7 @@ def compute_file_hash(path: Path) -> str:
     """MD5 of file content for exact duplicate detection."""
     h = hashlib.md5()
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
+        for chunk in iter(lambda: f.read(FILE_READ_CHUNK_SIZE), b""):
             h.update(chunk)
     return h.hexdigest()
 
@@ -240,11 +272,11 @@ def safe_copy(src: Path, candidate: Path) -> Optional[Path]:
         except FileExistsError:
             counter += 1
             continue
-        except OSError as e:
+        except OSError:
             return None
         try:
             with os.fdopen(fd, 'wb') as out_f, open(src, 'rb') as in_f:
-                shutil.copyfileobj(in_f, out_f, length=65536)
+                shutil.copyfileobj(in_f, out_f, length=FILE_READ_CHUNK_SIZE)
             # Try to copy metadata; failures here are non-fatal
             try:
                 shutil.copystat(str(src), str(target))
@@ -259,45 +291,37 @@ def safe_copy(src: Path, candidate: Path) -> Optional[Path]:
             return None
 
 
-def process_photo(path: Path) -> dict:
+def process_photo(path: Path) -> PhotoRecord:
     """Extract all metadata for one photo. Designed to run in a thread pool."""
-    result = {
-        "path": str(path),
-        "size": 0,
-        "date": None,
-        "date_source": "error",
-        "file_hash": None,
-        "phash": None,
-        "error": None,
-    }
+    record = PhotoRecord(path=str(path))
     try:
         stat = path.stat()
-        result["size"] = stat.st_size
+        record.size = stat.st_size
 
         dt, source = get_photo_date(path)
-        result["date"] = dt.isoformat() if dt else None
-        result["date_source"] = source
+        record.date = dt
+        record.date_source = source
 
-        result["file_hash"] = compute_file_hash(path)
+        record.file_hash = compute_file_hash(path)
         ph = compute_perceptual_hash(path)
-        result["phash"] = str(ph) if ph else None
+        record.phash = str(ph) if ph else None
 
     except Exception as e:
-        result["error"] = str(e)
+        record.error = str(e)
 
-    return result
+    return record
 
 # ── Duplicate Detection ────────────────────────────────────────────────────────
 
-def find_duplicates(photos: list[dict], hash_threshold: int) -> dict[str, list[str]]:
+def find_duplicates(photos: list[PhotoRecord], hash_threshold: int) -> dict[str, list[str]]:
     """
     Groups photos into duplicate sets.
     Returns {canonical_path: [duplicate_path, ...]}
-    
+
     Strategy:
       1. Exact match (same file hash) → definite duplicates
       2. Perceptual hash within threshold → visual duplicates
-    
+
     Within each group, keep the photo with the OLDEST date.
     """
     print(f"\n{Fore.CYAN}Grouping duplicates...")
@@ -305,8 +329,8 @@ def find_duplicates(photos: list[dict], hash_threshold: int) -> dict[str, list[s
     # ── Step 1: exact hash groups ──────────────────────────────────────────────
     hash_groups = defaultdict(list)
     for p in photos:
-        if p["file_hash"]:
-            hash_groups[p["file_hash"]].append(p)
+        if p.file_hash:
+            hash_groups[p.file_hash].append(p)
 
     exact_groups = {k: v for k, v in hash_groups.items() if len(v) > 1}
 
@@ -314,19 +338,24 @@ def find_duplicates(photos: list[dict], hash_threshold: int) -> dict[str, list[s
     exact_paths = set()
     for group in exact_groups.values():
         for p in group:
-            exact_paths.add(p["path"])
+            exact_paths.add(p.path)
 
     # ── Step 2: perceptual hash clustering ────────────────────────────────────
     # Only run on photos NOT already in an exact group
-    remaining = [p for p in photos if p["path"] not in exact_paths and p["phash"]]
+    remaining = [p for p in photos if p.path not in exact_paths and p.phash]
 
     # Build a list of (path, hash_obj)
     phash_entries = []
     for p in remaining:
         try:
-            phash_entries.append((p["path"], imagehash.hex_to_hash(p["phash"])))
+            phash_entries.append((p.path, imagehash.hex_to_hash(p.phash)))
         except Exception:
             pass
+
+    if len(phash_entries) > VISUAL_DEDUP_WARN_THRESHOLD:
+        print(f"{Fore.YELLOW}⚠  {len(phash_entries):,} photos need visual comparison — "
+              f"this step is O(n²) and may take a long time above "
+              f"{VISUAL_DEDUP_WARN_THRESHOLD:,}. Proceeding anyway.")
 
     # Greedy clustering: O(n²) but fine for <50k images with early exit
     visited = set()
@@ -351,22 +380,19 @@ def find_duplicates(photos: list[dict], hash_threshold: int) -> dict[str, list[s
 
     # ── Decide keeper for each group ──────────────────────────────────────────
     duplicates = {}  # keeper_path → [dup_path, ...]
-    photo_index = {p["path"]: p for p in photos}
+    photo_index = {p.path: p for p in photos}
 
     def pick_keeper(paths: list[str]) -> str:
         """Pick the photo with the oldest valid date; fall back to largest file."""
         def sort_key(path):
-            p = photo_index.get(path, {})
-            dt_str = p.get("date")
-            try:
-                dt = datetime.fromisoformat(dt_str) if dt_str else datetime.max
-            except ValueError:
-                dt = datetime.max
-            return (dt, -(p.get("size") or 0))
+            p = photo_index.get(path)
+            dt = p.date if p and p.date else datetime.max
+            size = p.size if p else 0
+            return (dt, -size)
         return sorted(paths, key=sort_key)[0]
 
     for group in exact_groups.values():
-        paths = [p["path"] for p in group]
+        paths = [p.path for p in group]
         keeper = pick_keeper(paths)
         dups = [p for p in paths if p != keeper]
         duplicates[keeper] = duplicates.get(keeper, []) + dups
@@ -380,34 +406,106 @@ def find_duplicates(photos: list[dict], hash_threshold: int) -> dict[str, list[s
 
 # ── Output Structure ───────────────────────────────────────────────────────────
 
-def destination_path(photo: dict, output_root: Path) -> Path:
+def destination_path(photo: PhotoRecord, output_root: Path) -> Path:
     """Compute the output path for an organized photo."""
-    dt_str = photo.get("date")
-    original = Path(photo["path"])
+    original = Path(photo.path)
 
-    if dt_str:
-        try:
-            dt = datetime.fromisoformat(dt_str)
-            folder = output_root / "organized" / f"{dt.year:04d}" / f"{dt.month:02d}"
-        except ValueError:
-            folder = output_root / "organized" / "unknown_date"
+    if photo.date:
+        folder = output_root / "organized" / f"{photo.date.year:04d}" / f"{photo.date.month:02d}"
     else:
         folder = output_root / "organized" / "unknown_date"
 
     # Return base destination (unique name guaranteed by safe_copy at write time)
     return folder / original.name
 
+# ── Scanning ────────────────────────────────────────────────────────────────────
+
+def scan_photos(source: Path) -> list[Path]:
+    """
+    Recursively find supported image files under `source`.
+
+    Symlinked files and directories are skipped: a symlink inside the source
+    tree could point outside of it (e.g. onto an untrusted removable drive),
+    which would otherwise let this tool read and copy arbitrary files that
+    were never intended to be part of the photo library.
+    """
+    found = []
+    for dirpath, dirnames, filenames in os.walk(source, followlinks=False):
+        dirnames[:] = [d for d in dirnames if not (Path(dirpath) / d).is_symlink()]
+        for name in filenames:
+            p = Path(dirpath) / name
+            if p.is_symlink():
+                continue
+            if p.suffix.lower() in SUPPORTED_EXTENSIONS:
+                found.append(p)
+    return found
+
+# ── Processing pipeline ─────────────────────────────────────────────────────────
+
+def process_all_photos(paths: list[Path], workers: int) -> list[PhotoRecord]:
+    """Extract dates and hashes for every photo, in parallel."""
+    photos = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(process_photo, p): p for p in paths}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="  Processing", unit="photo"):
+            photos.append(future.result())
+    return photos
+
+
+def organize_photos(photos: list[PhotoRecord], dup_groups: dict[str, list[str]],
+                     output: Path, dry_run: bool) -> OrganizeResults:
+    """Copy photos into organized/ and duplicates/ folders and collect results."""
+    dup_paths = set()
+    for dups in dup_groups.values():
+        dup_paths.update(dups)
+
+    organized_count = 0
+    errors = [{"path": p.path, "error": p.error} for p in photos if p.error]
+    suspicious = [p for p in photos if "SUSPICIOUS" in p.date_source or p.date is None]
+
+    print(f"\n{Fore.CYAN}{'[DRY RUN] ' if dry_run else ''}Organizing photos...")
+
+    dup_root = output / "duplicates"
+
+    for photo in tqdm(photos, desc="  Copying", unit="photo"):
+        if photo.error:
+            continue
+
+        path = Path(photo.path)
+        is_dup = photo.path in dup_paths
+        candidate = (dup_root / path.name) if is_dup else destination_path(photo, output)
+
+        if dry_run:
+            if not is_dup:
+                organized_count += 1
+            continue
+
+        copied = safe_copy(path, candidate)
+        if copied:
+            if not is_dup:
+                organized_count += 1
+        else:
+            kind = "duplicate" if is_dup else "organized photo"
+            errors.append({"path": photo.path, "error": f"Failed to copy {kind}"})
+
+    return OrganizeResults(
+        total=len(photos),
+        organized=organized_count,
+        duplicates=len(dup_paths),
+        errors=errors,
+        suspicious_dates=suspicious,
+        dup_groups=dup_groups,
+    )
+
 # ── Report Generation ──────────────────────────────────────────────────────────
 
-def generate_report(results: dict, output_root: Path, dry_run: bool, elapsed: float):
-    """Write a detailed HTML report."""
-    report_path = output_root / "photo_organizer_report.html"
-
-    total = results["total"]
-    organized = results["organized"]
-    dup_count = results["duplicates"]
-    errors = results["errors"]
-    suspicious = results["suspicious_dates"]
+def build_report_html(results: OrganizeResults, output_root: Path, dry_run: bool, elapsed: float) -> str:
+    """Render the HTML report from already-computed results."""
+    total = results.total
+    organized = results.organized
+    dup_count = results.duplicates
+    errors = results.errors
+    suspicious = results.suspicious_dates
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -464,31 +562,39 @@ Duplicates → <code>{output_root / "duplicates"}</code></p>
         html += "<h2>⚠️ Suspicious / Unverifiable Dates</h2>"
         html += "<p>These photos had missing, inconsistent, or out-of-range dates. They were organized using the best available date but should be reviewed.</p>"
         html += "<table><tr><th>File</th><th>Date Used</th><th>Source</th></tr>"
-        for item in suspicious[:500]:  # cap at 500 rows
-            html += f"<tr><td>{Path(item['path']).name}</td><td>{item.get('date','—')}</td><td>{item.get('date_source','—')}</td></tr>"
-        if len(suspicious) > 500:
-            html += f"<tr><td colspan='3'><em>...and {len(suspicious)-500} more</em></td></tr>"
+        for item in suspicious[:REPORT_MAX_SUSPICIOUS_ROWS]:
+            date_str = item.date.isoformat() if item.date else "—"
+            html += f"<tr><td>{Path(item.path).name}</td><td>{date_str}</td><td>{item.date_source or '—'}</td></tr>"
+        if len(suspicious) > REPORT_MAX_SUSPICIOUS_ROWS:
+            html += f"<tr><td colspan='3'><em>...and {len(suspicious) - REPORT_MAX_SUSPICIOUS_ROWS} more</em></td></tr>"
         html += "</table>"
 
     # Error table
     if errors:
         html += "<h2>❌ Errors</h2>"
         html += "<table><tr><th>File</th><th>Error</th></tr>"
-        for item in errors[:200]:
-            html += f"<tr><td>{Path(item['path']).name}</td><td>{item.get('error','')}</td></tr>"
+        for item in errors[:REPORT_MAX_ERROR_ROWS]:
+            html += f"<tr><td>{Path(item['path']).name}</td><td>{item.get('error', '')}</td></tr>"
         html += "</table>"
 
     # Duplicate groups
-    if results.get("dup_groups"):
+    if results.dup_groups:
         html += "<h2>🔁 Duplicate Groups (first 100)</h2>"
         html += "<table><tr><th>Kept</th><th>Duplicates moved</th></tr>"
-        for keeper, dups in list(results["dup_groups"].items())[:100]:
+        for keeper, dups in list(results.dup_groups.items())[:REPORT_MAX_DUP_GROUP_ROWS]:
             dup_names = "<br>".join(Path(d).name for d in dups)
             html += f"<tr><td>{Path(keeper).name}</td><td>{dup_names}</td></tr>"
         html += "</table>"
 
     html += f"<div class='footer'>Generated by photo_organizer.py on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>"
     html += "</body></html>"
+    return html
+
+
+def generate_report(results: OrganizeResults, output_root: Path, dry_run: bool, elapsed: float) -> Path:
+    """Write the HTML report to disk, atomically."""
+    report_path = output_root / "photo_organizer_report.html"
+    html = build_report_html(results, output_root, dry_run, elapsed)
 
     output_root.mkdir(parents=True, exist_ok=True)
     # Write report atomically to avoid partial files
@@ -503,9 +609,9 @@ Duplicates → <code>{output_root / "duplicates"}</code></p>
             pass
     return report_path
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Photo Organizer & Deduplicator")
     parser.add_argument("--source", required=True, help="Source folder containing your photos")
     parser.add_argument("--output", required=True, help="Output root folder")
@@ -513,14 +619,49 @@ def main():
     parser.add_argument("--hash-threshold", type=int, default=4,
                         help="Perceptual hash distance threshold (default 4 = very strict; 0 = exact visual match only)")
     parser.add_argument("--workers", type=int, default=4, help="Parallel workers for hashing")
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    source = Path(args.source)
-    output = Path(args.output)
+
+def validate_paths(source: Path, output: Path) -> tuple[Path, Path]:
+    """
+    Resolve --source/--output to absolute paths and reject configurations
+    that would cause the tool to scan or write over itself:
+      - source must exist
+      - output must not be the same as, or nested inside, source
+      - source must not be nested inside output
+    """
+    source = source.resolve()
+    output = output.resolve()
 
     if not source.exists():
         print(f"{Fore.RED}Source folder not found: {source}")
         sys.exit(1)
+
+    if output == source or output in source.parents or source in output.parents:
+        print(f"{Fore.RED}--output cannot be the same as, or nested inside, --source (and vice versa).")
+        print(f"  source: {source}")
+        print(f"  output: {output}")
+        sys.exit(1)
+
+    return source, output
+
+
+def print_summary(results: OrganizeResults, report_path: Path, elapsed: float, dry_run: bool) -> None:
+    print(f"\n{Fore.GREEN}{'─' * 50}")
+    print(f"{Fore.GREEN}✓ Done in {elapsed:.1f}s")
+    print(f"  Total scanned:      {results.total:,}")
+    print(f"  Organized:          {results.organized:,}")
+    print(f"  Duplicates found:   {results.duplicates:,}")
+    print(f"  Suspicious dates:   {len(results.suspicious_dates):,}")
+    print(f"  Errors:             {len(results.errors):,}")
+    print(f"\n  📄 Report: {report_path}")
+    if dry_run:
+        print(f"\n{Fore.YELLOW}  ⚠  This was a DRY RUN. Re-run without --dry-run to copy files.")
+
+
+def main():
+    args = parse_args()
+    source, output = validate_paths(Path(args.source), Path(args.output))
 
     if not HEIC_SUPPORTED:
         print(f"{Fore.YELLOW}⚠  pillow-heif not installed — HEIC files will be skipped.")
@@ -530,10 +671,7 @@ def main():
 
     # ── 1. Scan ────────────────────────────────────────────────────────────────
     print(f"{Fore.CYAN}Scanning {source} for photos...")
-    all_paths = [
-        p for p in source.rglob("*")
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
-    ]
+    all_paths = scan_photos(source)
     print(f"  Found {len(all_paths):,} image files")
 
     if not all_paths:
@@ -542,76 +680,20 @@ def main():
 
     # ── 2. Process (parallel) ─────────────────────────────────────────────────
     print(f"\n{Fore.CYAN}Extracting dates & computing hashes ({args.workers} workers)...")
-    photos = []
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_photo, p): p for p in all_paths}
-        for future in tqdm(as_completed(futures), total=len(futures), desc="  Processing", unit="photo"):
-            photos.append(future.result())
+    photos = process_all_photos(all_paths, args.workers)
 
     # ── 3. Find duplicates ────────────────────────────────────────────────────
     dup_groups = find_duplicates(photos, args.hash_threshold)
-    dup_paths = set()
-    for dups in dup_groups.values():
-        dup_paths.update(dups)
 
     # ── 4. Copy / organize ────────────────────────────────────────────────────
-    photo_index = {p["path"]: p for p in photos}
-    organized_count = 0
-    errors = [p for p in photos if p.get("error")]
-    suspicious = [p for p in photos if "SUSPICIOUS" in p.get("date_source", "") or p.get("date") is None]
-
-    print(f"\n{Fore.CYAN}{'[DRY RUN] ' if args.dry_run else ''}Organizing photos...")
-
-    organized_root = output / "organized"
-    dup_root = output / "duplicates"
-
-    for photo in tqdm(photos, desc="  Copying", unit="photo"):
-        path = Path(photo["path"])
-        if photo.get("error"):
-            continue
-
-        if photo["path"] in dup_paths:
-            candidate = dup_root / path.name
-            if not args.dry_run:
-                copied = safe_copy(path, candidate)
-                if not copied:
-                    errors.append({"path": photo["path"], "error": "Failed to copy duplicate"})
-        else:
-            candidate = destination_path(photo, output)
-            if not args.dry_run:
-                copied = safe_copy(path, candidate)
-                if copied:
-                    organized_count += 1
-                else:
-                    errors.append({"path": photo["path"], "error": "Failed to copy organized photo"})
-            else:
-                organized_count += 1
+    results = organize_photos(photos, dup_groups, output, args.dry_run)
 
     elapsed = time.time() - start_time
 
     # ── 5. Report ─────────────────────────────────────────────────────────────
-    results = {
-        "total": len(photos),
-        "organized": organized_count,
-        "duplicates": len(dup_paths),
-        "errors": errors,
-        "suspicious_dates": suspicious,
-        "dup_groups": dup_groups,
-    }
-
     report_path = generate_report(results, output, args.dry_run, elapsed)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    print(f"\n{Fore.GREEN}{'─'*50}")
-    print(f"{Fore.GREEN}✓ Done in {elapsed:.1f}s")
-    print(f"  Total scanned:      {len(photos):,}")
-    print(f"  Organized:          {organized_count:,}")
-    print(f"  Duplicates found:   {len(dup_paths):,}")
-    print(f"  Suspicious dates:   {len(suspicious):,}")
-    print(f"  Errors:             {len(errors):,}")
-    print(f"\n  📄 Report: {report_path}")
-    if args.dry_run:
-        print(f"\n{Fore.YELLOW}  ⚠  This was a DRY RUN. Re-run without --dry-run to copy files.")
+    print_summary(results, report_path, elapsed, args.dry_run)
 
 
 if __name__ == "__main__":

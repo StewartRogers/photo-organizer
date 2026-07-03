@@ -111,6 +111,20 @@ The HTML report (open in any browser) contains:
 
 ---
 
+## Notes on Safety
+
+- `--output` must not be nested inside `--source` (or vice versa) — the tool checks this on startup and exits with an error rather than risk scanning its own output or writing over your source photos.
+- Symlinked files and folders inside `--source` are skipped, so a stray symlink pointing outside your photo library can't cause unrelated files to be read or copied.
+
+## Running Tests
+
+```
+pip install pytest
+pytest tests/
+```
+
+---
+
 ## Supported Formats
 
 JPG, JPEG, PNG, GIF, BMP, TIFF, WebP, HEIC/HEIF (with pillow-heif), and RAW formats: CR2, CR3, NEF, ARW, ORF, RW2, DNG, RAF, PEF, SRW
