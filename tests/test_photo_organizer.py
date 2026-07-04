@@ -1,10 +1,15 @@
+import logging
 import sys
+import warnings
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import photo_organizer as po
+
+import imagehash
+from PIL import Image
 
 
 # ── parse_exif_date ─────────────────────────────────────────────────────────
@@ -96,6 +101,55 @@ def test_find_duplicates_falls_back_to_larger_file_when_no_date():
     dup_groups = po.find_duplicates([small, big], hash_threshold=4)
     # Neither has a date, so the larger file should be kept.
     assert dup_groups == {"/a/big.jpg": ["/a/small.jpg"]}
+
+
+# ── BKTree ───────────────────────────────────────────────────────────────────
+
+def test_bktree_query_finds_only_entries_within_radius():
+    tree = po.BKTree()
+    h0 = imagehash.hex_to_hash("0" * 16)
+    h1 = imagehash.hex_to_hash("0" * 15 + "1")   # 1 bit set -> distance 1 from h0
+    h5 = imagehash.hex_to_hash("0" * 14 + "1f")  # 5 bits set -> distance 5 from h0
+    tree.add("a", h0)
+    tree.add("b", h1)
+    tree.add("c", h5)
+
+    found = {path for path, _dist in tree.query(h0, radius=2)}
+
+    assert found == {"a", "b"}
+
+
+# ── find_duplicates visual (perceptual-hash) clustering ─────────────────────
+
+def test_find_duplicates_visual_match_via_perceptual_hash():
+    hash_a = str(imagehash.hex_to_hash("0" * 16))
+    hash_b = str(imagehash.hex_to_hash("0" * 15 + "3"))  # distance 2 from a
+
+    a = make_record("/x/a.jpg", file_hash="ha", phash=hash_a, date=datetime(2020, 1, 1))
+    b = make_record("/x/b.jpg", file_hash="hb", phash=hash_b, date=datetime(2020, 1, 5))
+
+    dup_groups = po.find_duplicates([a, b], hash_threshold=4)
+
+    assert dup_groups == {"/x/a.jpg": ["/x/b.jpg"]}
+
+
+def test_find_duplicates_visual_clustering_is_greedy_not_transitive():
+    # a<->b are within threshold, b<->c are within threshold, but a<->c are not.
+    # The original O(n^2) implementation claims matches for the first unclaimed
+    # "leader" it sees and never re-merges across leaders, so c ends up alone
+    # rather than transitively joining a's group. The BK-tree-backed rewrite
+    # must reproduce this exact behavior, not full transitive-closure clustering.
+    hash_a = str(imagehash.hex_to_hash("0" * 16))
+    hash_b = str(imagehash.hex_to_hash("0" * 15 + "7"))    # distance 3 from a
+    hash_c = str(imagehash.hex_to_hash("0" * 14 + "3f"))   # distance 3 from b, 6 from a
+
+    a = make_record("/x/a.jpg", file_hash="ha", phash=hash_a, date=datetime(2020, 1, 1))
+    b = make_record("/x/b.jpg", file_hash="hb", phash=hash_b, date=datetime(2020, 1, 2))
+    c = make_record("/x/c.jpg", file_hash="hc", phash=hash_c, date=datetime(2020, 1, 3))
+
+    dup_groups = po.find_duplicates([a, b, c], hash_threshold=4)
+
+    assert dup_groups == {"/x/a.jpg": ["/x/b.jpg"]}
 
 
 # ── safe_copy ────────────────────────────────────────────────────────────────
@@ -200,3 +254,94 @@ def test_validate_paths_accepts_sibling_dirs(tmp_path):
 
     assert resolved_source == source.resolve()
     assert resolved_output == output.resolve()
+
+
+# ── resolve_log_path ─────────────────────────────────────────────────────────
+
+def test_resolve_log_path_default(tmp_path):
+    output = tmp_path / "output"
+    assert po.resolve_log_path(None, output) == output / "photo_organizer.log"
+
+
+def test_resolve_log_path_explicit(tmp_path):
+    output = tmp_path / "output"
+    custom = tmp_path / "custom.log"
+    assert po.resolve_log_path(str(custom), output) == custom
+
+
+# ── setup_logging ────────────────────────────────────────────────────────────
+
+def test_setup_logging_writes_file_and_captures_warnings(tmp_path):
+    log_path = tmp_path / "run.log"
+    root = logging.getLogger()
+    original_handlers = list(root.handlers)
+    original_level = root.level
+    try:
+        po.setup_logging(log_path)
+        warnings.warn("test warning message", UserWarning)
+        for h in root.handlers:
+            h.flush()
+        content = log_path.read_text(encoding="utf-8")
+        assert "test warning message" in content
+    finally:
+        for h in list(root.handlers):
+            if h not in original_handlers:
+                root.removeHandler(h)
+                h.close()
+        root.setLevel(original_level)
+        logging.captureWarnings(False)
+
+
+# ── compute_perceptual_hash ──────────────────────────────────────────────────
+
+def test_compute_perceptual_hash_no_warning_on_palette_transparency(tmp_path):
+    img = Image.new("P", (8, 8))
+    img.info["transparency"] = 0
+    path = tmp_path / "palette.png"
+    img.save(path, format="PNG")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = po.compute_perceptual_hash(path)
+
+    assert result is not None
+    assert not any("Palette images with Transparency" in str(w.message) for w in caught)
+
+
+# ── build_report_html error overflow ────────────────────────────────────────
+
+def test_build_report_html_shows_error_overflow_count():
+    errors = [{"path": f"/a/{i}.jpg", "error": "boom"} for i in range(po.REPORT_MAX_ERROR_ROWS + 5)]
+    results = po.OrganizeResults(total=205, organized=0, duplicates=0, errors=errors)
+    html = po.build_report_html(results, Path("/out"), dry_run=False, elapsed=1.0)
+    assert "...and 5 more" in html
+
+
+# ── organize_photos errors/ folder ──────────────────────────────────────────
+
+def test_organize_photos_copies_errored_photo_to_errors_folder(tmp_path):
+    src = tmp_path / "bad.jpg"
+    src.write_bytes(b"not really a photo")
+    output = tmp_path / "out"
+
+    record = make_record(str(src))
+    record.error = "could not read EXIF"
+
+    results = po.organize_photos([record], {}, output, dry_run=False)
+
+    assert (output / "errors" / "bad.jpg").read_bytes() == b"not really a photo"
+    assert results.errors_copied == 1
+
+
+def test_organize_photos_dry_run_does_not_copy_errored_photo(tmp_path):
+    src = tmp_path / "bad.jpg"
+    src.write_bytes(b"not really a photo")
+    output = tmp_path / "out"
+
+    record = make_record(str(src))
+    record.error = "could not read EXIF"
+
+    results = po.organize_photos([record], {}, output, dry_run=True)
+
+    assert not (output / "errors").exists()
+    assert results.errors_copied == 0

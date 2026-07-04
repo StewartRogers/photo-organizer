@@ -20,6 +20,7 @@ Optional flags:
     --dry-run          Preview actions without copying anything
     --hash-threshold   Hamming distance for similarity (default: 4, lower = stricter)
     --workers          Parallel workers for hashing (default: 4)
+    --log-file         Path to log file (default: <output>/photo_organizer.log)
 """
 
 import os
@@ -27,7 +28,9 @@ import sys
 import shutil
 import hashlib
 import argparse
+import logging
 import re
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -80,6 +83,25 @@ REPORT_MAX_SUSPICIOUS_ROWS = 500
 REPORT_MAX_ERROR_ROWS = 200
 REPORT_MAX_DUP_GROUP_ROWS = 100
 
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(log_path: Path) -> None:
+    """
+    Log errors/warnings to a file, and route Python warnings (e.g. Pillow's
+    palette/transparency UserWarning) there too instead of stderr, so they
+    don't clutter stdout or interrupt the tqdm progress bars.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.setLevel(logging.WARNING)
+    root.addHandler(handler)
+    logging.captureWarnings(True)
+
 # ── Data model ─────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -100,6 +122,7 @@ class OrganizeResults:
     organized: int
     duplicates: int
     errors: list = field(default_factory=list)
+    errors_copied: int = 0
     suspicious_dates: list = field(default_factory=list)
     dup_groups: dict = field(default_factory=dict)
 
@@ -238,6 +261,8 @@ def compute_perceptual_hash(path: Path) -> Optional[imagehash.ImageHash]:
     """Perceptual hash for visual similarity."""
     try:
         with Image.open(path) as img:
+            if img.mode == "P" and "transparency" in img.info:
+                img = img.convert("RGBA")
             img = img.convert("RGB")
             return imagehash.phash(img, hash_size=16)  # larger = more precise
     except Exception:
@@ -308,10 +333,68 @@ def process_photo(path: Path) -> PhotoRecord:
 
     except Exception as e:
         record.error = str(e)
+        logger.error("Failed to process %s: %s", path, e)
 
     return record
 
 # ── Duplicate Detection ────────────────────────────────────────────────────────
+
+class _BKNode:
+    """One entry in a BKTree, plus its children indexed by distance from it."""
+    __slots__ = ("path", "hash_obj", "children")
+
+    def __init__(self, path: str, hash_obj):
+        self.path = path
+        self.hash_obj = hash_obj
+        self.children: dict[int, "_BKNode"] = {}
+
+
+class BKTree:
+    """
+    BK-tree over perceptual hashes, supporting fast "all points within radius
+    r of a query" lookups under Hamming distance. Used so find_duplicates()'s
+    visual-similarity pass doesn't have to compare every photo against every
+    other photo (which is O(n^2) and becomes hours-long above ~10-20k photos).
+
+    Insertion and lookup rely only on the triangle inequality holding for the
+    distance function (true for Hamming distance / imagehash's `-` operator),
+    so this doesn't change which photos are found within `hash_threshold` of
+    each other — only how quickly they're found.
+    """
+
+    def __init__(self):
+        self.root: Optional[_BKNode] = None
+
+    def add(self, path: str, hash_obj) -> None:
+        if self.root is None:
+            self.root = _BKNode(path, hash_obj)
+            return
+        node = self.root
+        while True:
+            d = abs(hash_obj - node.hash_obj)
+            child = node.children.get(d)
+            if child is None:
+                node.children[d] = _BKNode(path, hash_obj)
+                return
+            node = child
+
+    def query(self, hash_obj, radius: int) -> list[tuple[str, int]]:
+        """Return [(path, distance), ...] for every entry within `radius` of hash_obj."""
+        if self.root is None:
+            return []
+        results = []
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            d = abs(hash_obj - node.hash_obj)
+            if d <= radius:
+                results.append((node.path, d))
+            lo, hi = d - radius, d + radius
+            for child_dist, child in node.children.items():
+                if lo <= child_dist <= hi:
+                    stack.append(child)
+        return results
+
 
 def find_duplicates(photos: list[PhotoRecord], hash_threshold: int) -> dict[str, list[str]]:
     """
@@ -354,27 +437,33 @@ def find_duplicates(photos: list[PhotoRecord], hash_threshold: int) -> dict[str,
 
     if len(phash_entries) > VISUAL_DEDUP_WARN_THRESHOLD:
         print(f"{Fore.YELLOW}⚠  {len(phash_entries):,} photos need visual comparison — "
-              f"this step is O(n²) and may take a long time above "
-              f"{VISUAL_DEDUP_WARN_THRESHOLD:,}. Proceeding anyway.")
+              f"a very large --hash-threshold on a very large library can still be slow "
+              f"in the worst case. Proceeding anyway.")
 
-    # Greedy clustering: O(n²) but fine for <50k images with early exit
+    # Greedy clustering: each not-yet-claimed photo becomes a group leader and
+    # claims every not-yet-claimed photo within hash_threshold of it. A BKTree
+    # is used to find those matches without comparing against every other
+    # photo (see BKTree docstring) — this changes performance, not which
+    # groups come out the other end.
+    tree = BKTree()
+    for path, hash_obj in phash_entries:
+        tree.add(path, hash_obj)
+
     visited = set()
     visual_groups = []
 
     print(f"  Comparing {len(phash_entries):,} perceptual hashes (threshold={hash_threshold})...")
 
-    for i, (path_i, hash_i) in enumerate(tqdm(phash_entries, desc="  Visual compare", unit="photo")):
+    for path_i, hash_i in tqdm(phash_entries, desc="  Visual compare", unit="photo"):
         if path_i in visited:
             continue
         group = [path_i]
         visited.add(path_i)
-        for j in range(i + 1, len(phash_entries)):
-            path_j, hash_j = phash_entries[j]
-            if path_j in visited:
+        for path_j, _dist in tree.query(hash_i, hash_threshold):
+            if path_j == path_i or path_j in visited:
                 continue
-            if abs(hash_i - hash_j) <= hash_threshold:
-                group.append(path_j)
-                visited.add(path_j)
+            group.append(path_j)
+            visited.add(path_j)
         if len(group) > 1:
             visual_groups.append(group)
 
@@ -466,12 +555,22 @@ def organize_photos(photos: list[PhotoRecord], dup_groups: dict[str, list[str]],
     print(f"\n{Fore.CYAN}{'[DRY RUN] ' if dry_run else ''}Organizing photos...")
 
     dup_root = output / "duplicates"
+    error_root = output / "errors"
+    errors_copied = 0
 
     for photo in tqdm(photos, desc="  Copying", unit="photo"):
+        path = Path(photo.path)
+
         if photo.error:
+            if not dry_run:
+                copied = safe_copy(path, error_root / path.name)
+                if copied:
+                    errors_copied += 1
+                else:
+                    logger.error("Could not copy errored photo %s to errors/: %s",
+                                 photo.path, photo.error)
             continue
 
-        path = Path(photo.path)
         is_dup = photo.path in dup_paths
         candidate = (dup_root / path.name) if is_dup else destination_path(photo, output)
 
@@ -487,12 +586,14 @@ def organize_photos(photos: list[PhotoRecord], dup_groups: dict[str, list[str]],
         else:
             kind = "duplicate" if is_dup else "organized photo"
             errors.append({"path": photo.path, "error": f"Failed to copy {kind}"})
+            logger.error("Failed to copy %s: %s", kind, photo.path)
 
     return OrganizeResults(
         total=len(photos),
         organized=organized_count,
         duplicates=len(dup_paths),
         errors=errors,
+        errors_copied=errors_copied,
         suspicious_dates=suspicious,
         dup_groups=dup_groups,
     )
@@ -549,12 +650,14 @@ def build_report_html(results: OrganizeResults, output_root: Path, dry_run: bool
   <div class="stat"><div class="num">{dup_count:,}</div><div class="label">Duplicates found</div></div>
   <div class="stat"><div class="num">{len(suspicious):,}</div><div class="label">Suspicious dates</div></div>
   <div class="stat"><div class="num">{len(errors):,}</div><div class="label">Errors</div></div>
+  <div class="stat"><div class="num">{results.errors_copied:,}</div><div class="label">Copied to errors/</div></div>
   <div class="stat"><div class="num">{elapsed:.0f}s</div><div class="label">Processing time</div></div>
 </div>
 
 <h2>📁 Output Structure</h2>
 <p>Organized photos → <code>{output_root / "organized"}</code><br>
-Duplicates → <code>{output_root / "duplicates"}</code></p>
+Duplicates → <code>{output_root / "duplicates"}</code><br>
+Errored photos → <code>{output_root / "errors"}</code></p>
 """
 
     # Suspicious dates table
@@ -572,9 +675,12 @@ Duplicates → <code>{output_root / "duplicates"}</code></p>
     # Error table
     if errors:
         html += "<h2>❌ Errors</h2>"
+        html += "<p>Photos that failed date/hash processing were still copied to <code>errors/</code> for inspection; photos that failed to copy to their destination were not.</p>"
         html += "<table><tr><th>File</th><th>Error</th></tr>"
         for item in errors[:REPORT_MAX_ERROR_ROWS]:
             html += f"<tr><td>{Path(item['path']).name}</td><td>{item.get('error', '')}</td></tr>"
+        if len(errors) > REPORT_MAX_ERROR_ROWS:
+            html += f"<tr><td colspan='2'><em>...and {len(errors) - REPORT_MAX_ERROR_ROWS} more</em></td></tr>"
         html += "</table>"
 
     # Duplicate groups
@@ -619,7 +725,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hash-threshold", type=int, default=4,
                         help="Perceptual hash distance threshold (default 4 = very strict; 0 = exact visual match only)")
     parser.add_argument("--workers", type=int, default=4, help="Parallel workers for hashing")
+    parser.add_argument("--log-file", help="Path to log file (default: <output>/photo_organizer.log)")
     return parser.parse_args()
+
+
+def resolve_log_path(log_file_arg: Optional[str], output: Path) -> Path:
+    """Resolve the --log-file argument to a concrete path, defaulting to
+    <output>/photo_organizer.log."""
+    return Path(log_file_arg) if log_file_arg else output / "photo_organizer.log"
 
 
 def validate_paths(source: Path, output: Path) -> tuple[Path, Path]:
@@ -646,7 +759,8 @@ def validate_paths(source: Path, output: Path) -> tuple[Path, Path]:
     return source, output
 
 
-def print_summary(results: OrganizeResults, report_path: Path, elapsed: float, dry_run: bool) -> None:
+def print_summary(results: OrganizeResults, report_path: Path, log_path: Path,
+                   elapsed: float, dry_run: bool) -> None:
     print(f"\n{Fore.GREEN}{'─' * 50}")
     print(f"{Fore.GREEN}✓ Done in {elapsed:.1f}s")
     print(f"  Total scanned:      {results.total:,}")
@@ -654,7 +768,9 @@ def print_summary(results: OrganizeResults, report_path: Path, elapsed: float, d
     print(f"  Duplicates found:   {results.duplicates:,}")
     print(f"  Suspicious dates:   {len(results.suspicious_dates):,}")
     print(f"  Errors:             {len(results.errors):,}")
+    print(f"  Copied to errors/:  {results.errors_copied:,}")
     print(f"\n  📄 Report: {report_path}")
+    print(f"  📝 Log:    {log_path}")
     if dry_run:
         print(f"\n{Fore.YELLOW}  ⚠  This was a DRY RUN. Re-run without --dry-run to copy files.")
 
@@ -662,6 +778,9 @@ def print_summary(results: OrganizeResults, report_path: Path, elapsed: float, d
 def main():
     args = parse_args()
     source, output = validate_paths(Path(args.source), Path(args.output))
+
+    log_path = resolve_log_path(args.log_file, output)
+    setup_logging(log_path)
 
     if not HEIC_SUPPORTED:
         print(f"{Fore.YELLOW}⚠  pillow-heif not installed — HEIC files will be skipped.")
@@ -693,7 +812,7 @@ def main():
     # ── 5. Report ─────────────────────────────────────────────────────────────
     report_path = generate_report(results, output, args.dry_run, elapsed)
 
-    print_summary(results, report_path, elapsed, args.dry_run)
+    print_summary(results, report_path, log_path, elapsed, args.dry_run)
 
 
 if __name__ == "__main__":

@@ -75,6 +75,7 @@ python photo_organizer.py --source "C:\Photos\My Pictures" --output "C:\Photos\O
 | `--dry-run` | off | Preview only — no files are copied |
 | `--hash-threshold` | 4 | Visual similarity strictness (0 = identical only, 4 = very strict, 10 = moderate) |
 | `--workers` | 4 | Parallel threads for hashing (increase to 8 on fast machines) |
+| `--log-file` | `<output>/photo_organizer.log` | Path to the log file (errors and library warnings) |
 
 ---
 
@@ -93,7 +94,10 @@ C:\Photos\Organized\
 ├── duplicates\              ← review these before deleting
 │   ├── IMG_1234_copy.jpg
 │   └── ...
-└── photo_organizer_report.html
+├── errors\                  ← photos that failed date/hash processing, copied here for inspection
+│   └── ...
+├── photo_organizer_report.html
+└── photo_organizer.log      ← errors and library warnings from this run
 ```
 
 ---
@@ -105,7 +109,7 @@ The HTML report (open in any browser) contains:
 - **Summary stats** — totals, time taken
 - **Suspicious dates** — photos where the date might be wrong (out-of-range years, no EXIF data)
 - **Duplicate groups** — which file was kept and which were moved to `/duplicates`
-- **Errors** — any files that couldn't be processed
+- **Errors** — any files that couldn't be fully processed (also copied to `/errors` for inspection)
 
 ---
 
@@ -135,10 +139,12 @@ JPG, JPEG, PNG, GIF, BMP, TIFF, WebP, HEIC/HEIF (with pillow-heif), and RAW form
 - **Use `--workers 8`** on a modern machine to speed up date/hash extraction — note
   this does **not** speed up the visual-duplicate comparison step below, which is
   single-threaded.
-- The visual-duplicate comparison step is O(n²) and is the slowest part of a run.
-  Measured on real hardware: ~1.6s at 500 photos, ~28s at 2,000, ~10.5 min at
-  10,000. At 50k photos, expect **several hours**, not 1–3 — budget accordingly
-  and prefer to run this unattended.
+- The visual-duplicate comparison step uses a BK-tree index (instead of comparing
+  every photo against every other photo), so it scales far better than a naive
+  approach — tens of thousands of photos should take minutes, not hours. Very
+  large libraries or an unusually high `--hash-threshold` can still be slower in
+  the worst case, so budget extra time and prefer to run unattended for the
+  first pass on a new library.
 - After running, review the `duplicates/` folder before deleting anything. The script never deletes files.
 - Photos with suspicious dates land in `organized/unknown_date/` — you can manually sort those.
 
