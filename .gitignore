@@ -18,3 +18,6 @@ photo_organizer_report.html
 .vscode/
 .idea/
 .DS_Store
+
+# Claude Code — local, machine-specific permissions (not shared)
+.claude/settings.local.json
