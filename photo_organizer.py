@@ -1,16 +1,19 @@
 """
 Photo Organizer & Deduplicator
 ================================
-- Scans a source folder recursively for images
+- Scans a source folder recursively for images and videos
 - Reads EXIF DateTimeOriginal (most trustworthy) with fallbacks
 - Detects visually similar images using perceptual hashing (very strict mode)
 - Keeps the copy with the oldest EXIF date when duplicates are found
 - Copies organized photos to a new folder structure: YYYY/MM/
+- Videos are dated from container metadata (creation time — most trustworthy)
+  with filename/filesystem fallbacks, and copied into the same YYYY/MM/ folder
+  as photos, but are never deduplicated
 - Moves suspected duplicates to a separate review folder
 - Generates a detailed HTML report of all actions
 
 Requirements (install with pip):
-    pip install Pillow pillow-heif piexif imagehash tqdm colorama
+    pip install Pillow pillow-heif piexif imagehash tqdm colorama hachoir
     pip install pillow-avif-plugin  # optional, for AVIF support
 
 Usage:
@@ -21,6 +24,8 @@ Optional flags:
     --hash-threshold   Hamming distance for similarity (default: 4, lower = stricter)
     --workers          Parallel workers for hashing (default: 4)
     --log-file         Path to log file (default: <output>/photo_organizer.log)
+    --retry-file       Reprocess only the photos listed in this file (see
+                       <output>/retry_photos.txt from a previous run)
 """
 
 import os
@@ -60,13 +65,36 @@ try:
 except ImportError:
     HEIC_SUPPORTED = False
 
+# Try to enable video container metadata (creation date) support
+try:
+    import hachoir.core.config as _hachoir_config
+    _hachoir_config.quiet = True  # suppress hachoir's own "[warn] ..." console spam
+    from hachoir.parser import createParser
+    from hachoir.metadata import extractMetadata
+    VIDEO_METADATA_SUPPORTED = True
+except ImportError:
+    VIDEO_METADATA_SUPPORTED = False
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-SUPPORTED_EXTENSIONS = {
+SUPPORTED_PHOTO_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
     '.webp', '.heic', '.heif', '.cr2', '.cr3', '.nef', '.arw',
     '.orf', '.rw2', '.dng', '.raf', '.pef', '.srw', '.raw'
 }
+
+# Videos are organized by date alongside photos (so a trip's photos and clips
+# land in the same YYYY/MM folder), but never deduplicated — no MD5/perceptual
+# hashing is done for these, see process_photo().
+SUPPORTED_VIDEO_EXTENSIONS = {
+    '.mp4', '.mov', '.avi', '.mpg', '.mpeg', '.m4v', '.wmv',
+    '.3gp', '.mkv', '.flv', '.webm'
+}
+
+
+def is_video(path: Path) -> bool:
+    """True if `path`'s extension is a supported video format."""
+    return path.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS
 
 # Suspicious year range — flag dates outside this as potentially wrong
 MIN_VALID_YEAR = 1990
@@ -82,6 +110,12 @@ VISUAL_DEDUP_WARN_THRESHOLD = 50_000
 REPORT_MAX_SUSPICIOUS_ROWS = 500
 REPORT_MAX_ERROR_ROWS = 200
 REPORT_MAX_DUP_GROUP_ROWS = 100
+REPORT_MAX_CLOUD_ONLY_ROWS = 200
+
+# Windows-only: cloud-sync clients (OneDrive, etc.) mark a not-yet-downloaded
+# "placeholder" file with this attribute. stat() succeeds on these (size/dates
+# are available), but reading their content fails until they're hydrated.
+FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -114,6 +148,7 @@ class PhotoRecord:
     file_hash: Optional[str] = None
     phash: Optional[str] = None
     error: Optional[str] = None
+    cloud_only: bool = False
 
 
 @dataclass
@@ -123,6 +158,7 @@ class OrganizeResults:
     duplicates: int
     errors: list = field(default_factory=list)
     errors_copied: int = 0
+    cloud_only: list = field(default_factory=list)
     suspicious_dates: list = field(default_factory=list)
     dup_groups: dict = field(default_factory=dict)
 
@@ -246,6 +282,61 @@ def get_photo_date(path: Path) -> tuple[Optional[datetime], str]:
 
     return None, "no date found"
 
+
+def get_video_date(path: Path) -> tuple[Optional[datetime], str]:
+    """
+    Returns (datetime, source_description) using this priority:
+      1. Container metadata (creation_time)  ← most trustworthy
+      2. Filename pattern
+      3. File system date                    ← least trustworthy
+
+    Mirrors get_photo_date()'s fallback structure, but reads a video
+    container's own creation-date metadata (MP4/MOV/AVI/MKV/... via hachoir)
+    instead of EXIF, since Pillow can't open video files at all.
+    """
+    dt = None
+    source = "unknown"
+
+    # ── Container metadata ─────────────────────────────
+    if VIDEO_METADATA_SUPPORTED:
+        try:
+            parser = createParser(str(path))
+            if parser:
+                try:
+                    metadata = extractMetadata(parser)
+                finally:
+                    parser.stream.close()
+                candidate = metadata.get("creation_date", None) if metadata else None
+                if isinstance(candidate, datetime):
+                    if not is_date_suspicious(candidate):
+                        return candidate, "video metadata"
+                    dt, source = candidate, "video metadata"
+        except Exception:
+            # Be conservative: don't let metadata parsing crash the run
+            pass
+
+    # ── Filename ──────────────────────────────────────
+    fn_date = extract_date_from_filename(path)
+    if fn_date and not is_date_suspicious(fn_date):
+        return fn_date, "filename"
+
+    # ── File system fallback ──────────────────────────
+    try:
+        stat = path.stat()
+        fs_time = min(stat.st_mtime, stat.st_ctime)
+        fs_date = datetime.fromtimestamp(fs_time)
+        if not is_date_suspicious(fs_date):
+            if dt:  # we had a suspicious video-metadata date — prefer filesystem
+                return fs_date, "filesystem (video metadata suspicious)"
+            return fs_date, "filesystem"
+    except Exception:
+        pass
+
+    if dt:
+        return dt, f"{source} (SUSPICIOUS — year {dt.year})"
+
+    return None, "no date found"
+
 # ── Hashing & Deduplication ────────────────────────────────────────────────────
 
 def compute_file_hash(path: Path) -> str:
@@ -269,19 +360,19 @@ def compute_perceptual_hash(path: Path) -> Optional[imagehash.ImageHash]:
         return None
 
 
-def safe_copy(src: Path, candidate: Path) -> Optional[Path]:
+def safe_copy(src: Path, candidate: Path) -> tuple[Optional[Path], Optional[str]]:
     """
     Safely copy `src` to `candidate` without overwriting existing files.
     This function attempts to create the destination file using O_EXCL to
     guarantee we never overwrite an existing file. If the candidate exists,
     it will append _1, _2, ... to the stem until an unused name is found.
-    Returns the path of the copied file, or None on error.
+    Returns (path, None) on success, or (None, error_message) on failure.
     """
     dest_dir = candidate.parent
     try:
         dest_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        return None
+    except Exception as e:
+        return None, str(e)
 
     stem = candidate.stem
     suffix = candidate.suffix
@@ -297,8 +388,8 @@ def safe_copy(src: Path, candidate: Path) -> Optional[Path]:
         except FileExistsError:
             counter += 1
             continue
-        except OSError:
-            return None
+        except OSError as e:
+            return None, str(e)
         try:
             with os.fdopen(fd, 'wb') as out_f, open(src, 'rb') as in_f:
                 shutil.copyfileobj(in_f, out_f, length=FILE_READ_CHUNK_SIZE)
@@ -307,13 +398,23 @@ def safe_copy(src: Path, candidate: Path) -> Optional[Path]:
                 shutil.copystat(str(src), str(target))
             except Exception:
                 pass
-            return target
-        except Exception:
+            return target, None
+        except Exception as e:
             try:
                 target.unlink()
             except Exception:
                 pass
-            return None
+            return None, str(e)
+
+
+def is_cloud_only_placeholder(stat_result: os.stat_result) -> bool:
+    """
+    True if `stat_result` is a cloud-sync placeholder (e.g. a OneDrive Files
+    On-Demand file) that hasn't been downloaded to this machine yet. Always
+    False on platforms/objects without st_file_attributes (non-Windows).
+    """
+    attrs = getattr(stat_result, "st_file_attributes", 0)
+    return bool(attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
 
 
 def process_photo(path: Path) -> PhotoRecord:
@@ -323,13 +424,22 @@ def process_photo(path: Path) -> PhotoRecord:
         stat = path.stat()
         record.size = stat.st_size
 
-        dt, source = get_photo_date(path)
+        if is_cloud_only_placeholder(stat):
+            record.cloud_only = True
+            return record
+
+        video = is_video(path)
+        dt, source = get_video_date(path) if video else get_photo_date(path)
         record.date = dt
         record.date_source = source
 
-        record.file_hash = compute_file_hash(path)
-        ph = compute_perceptual_hash(path)
-        record.phash = str(ph) if ph else None
+        # Videos are organized by date like photos, but never deduplicated:
+        # leaving file_hash/phash unset means find_duplicates() (which only
+        # groups records with a truthy hash) simply never considers them.
+        if not video:
+            record.file_hash = compute_file_hash(path)
+            ph = compute_perceptual_hash(path)
+            record.phash = str(ph) if ph else None
 
     except Exception as e:
         record.error = str(e)
@@ -511,7 +621,7 @@ def destination_path(photo: PhotoRecord, output_root: Path) -> Path:
 
 def scan_photos(source: Path) -> list[Path]:
     """
-    Recursively find supported image files under `source`.
+    Recursively find supported image and video files under `source`.
 
     Symlinked files and directories are skipped: a symlink inside the source
     tree could point outside of it (e.g. onto an untrusted removable drive),
@@ -525,9 +635,84 @@ def scan_photos(source: Path) -> list[Path]:
             p = Path(dirpath) / name
             if p.is_symlink():
                 continue
-            if p.suffix.lower() in SUPPORTED_EXTENSIONS:
+            suffix = p.suffix.lower()
+            if suffix in SUPPORTED_PHOTO_EXTENSIONS or suffix in SUPPORTED_VIDEO_EXTENSIONS:
                 found.append(p)
     return found
+
+
+def load_retry_paths(retry_file: Path) -> list[Path]:
+    """
+    Load photo paths from a previous run's retry file (one path per line, as
+    written by write_retry_file()), letting a follow-up run reprocess just the
+    photos that didn't make it into organized/ or duplicates/ last time,
+    instead of a full re-scan of --source.
+    """
+    lines = retry_file.read_text(encoding="utf-8").splitlines()
+    return [Path(line) for line in lines if line.strip()]
+
+
+def estimate_required_bytes(paths: list[Path]) -> tuple[int, int]:
+    """
+    Sum up file sizes for a worst-case destination-space estimate.
+
+    organize_photos() never skips a file for being a duplicate — it copies it
+    to duplicates/ instead of organized/ — so total destination usage is
+    essentially the total size of every currently-readable photo, regardless
+    of how many turn out to be duplicates. stat() reports the correct size
+    for cloud-only placeholders without downloading them, so those bytes are
+    counted separately (skipped this run, but may be needed for a future
+    --retry-file run once they're synced).
+
+    Returns (needed_bytes, cloud_only_bytes).
+    """
+    needed_bytes = 0
+    cloud_only_bytes = 0
+    for p in paths:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if is_cloud_only_placeholder(st):
+            cloud_only_bytes += st.st_size
+        else:
+            needed_bytes += st.st_size
+    return needed_bytes, cloud_only_bytes
+
+
+def check_disk_space(paths: list[Path], output: Path, dry_run: bool) -> None:
+    """
+    Pre-flight worst-case space check, run before the (potentially
+    hours-long) processing pass — so a full destination drive is caught
+    immediately instead of partway through copying (see CLAUDE.md's
+    2026-07-04 OneDrive incident, where this was discovered the hard way).
+    Exits with an error if there isn't enough room, unless --dry-run (which
+    never copies anything, so it's safe to preview regardless).
+    """
+    needed_bytes, cloud_only_bytes = estimate_required_bytes(paths)
+
+    check_dir = output
+    while not check_dir.exists():
+        check_dir = check_dir.parent
+    free_bytes = shutil.disk_usage(check_dir).free
+
+    gb = 1024 ** 3
+    print(f"{Fore.CYAN}Estimated space needed: {needed_bytes / gb:.2f} GB "
+          f"(worst case — duplicates are copied too, not skipped)")
+    if cloud_only_bytes:
+        print(f"  + {cloud_only_bytes / gb:.2f} GB currently cloud-only "
+              f"(not counted; skipped this run)")
+    print(f"  Free on destination:    {free_bytes / gb:.2f} GB")
+
+    if needed_bytes > free_bytes:
+        shortfall_gb = (needed_bytes - free_bytes) / gb
+        if dry_run:
+            print(f"{Fore.YELLOW}⚠  Not enough free space for a real run: "
+                  f"~{shortfall_gb:.2f} GB short. Continuing since this is --dry-run.")
+        else:
+            print(f"{Fore.RED}✗ Not enough free space: ~{shortfall_gb:.2f} GB short. "
+                  f"Free up space or point --output at a different drive, then retry.")
+            sys.exit(1)
 
 # ── Processing pipeline ─────────────────────────────────────────────────────────
 
@@ -550,7 +735,12 @@ def organize_photos(photos: list[PhotoRecord], dup_groups: dict[str, list[str]],
 
     organized_count = 0
     errors = [{"path": p.path, "error": p.error} for p in photos if p.error]
-    suspicious = [p for p in photos if "SUSPICIOUS" in p.date_source or p.date is None]
+    cloud_only = [p.path for p in photos if p.cloud_only]
+    # Cloud-only photos never reach get_photo_date() (date stays None), so
+    # exclude them here — they're not "suspicious", just not synced yet, and
+    # are already reported in their own category above.
+    suspicious = [p for p in photos
+                  if not p.cloud_only and ("SUSPICIOUS" in p.date_source or p.date is None)]
 
     print(f"\n{Fore.CYAN}{'[DRY RUN] ' if dry_run else ''}Organizing photos...")
 
@@ -561,14 +751,20 @@ def organize_photos(photos: list[PhotoRecord], dup_groups: dict[str, list[str]],
     for photo in tqdm(photos, desc="  Copying", unit="photo"):
         path = Path(photo.path)
 
+        if photo.cloud_only:
+            # Not downloaded locally yet — nothing to copy. Leave it in
+            # --source untouched; it's reported separately so it can be
+            # retried (via --retry-file) once it's synced.
+            continue
+
         if photo.error:
             if not dry_run:
-                copied = safe_copy(path, error_root / path.name)
+                copied, copy_err = safe_copy(path, error_root / path.name)
                 if copied:
                     errors_copied += 1
                 else:
                     logger.error("Could not copy errored photo %s to errors/: %s",
-                                 photo.path, photo.error)
+                                 photo.path, copy_err)
             continue
 
         is_dup = photo.path in dup_paths
@@ -579,14 +775,14 @@ def organize_photos(photos: list[PhotoRecord], dup_groups: dict[str, list[str]],
                 organized_count += 1
             continue
 
-        copied = safe_copy(path, candidate)
+        copied, copy_err = safe_copy(path, candidate)
         if copied:
             if not is_dup:
                 organized_count += 1
         else:
             kind = "duplicate" if is_dup else "organized photo"
-            errors.append({"path": photo.path, "error": f"Failed to copy {kind}"})
-            logger.error("Failed to copy %s: %s", kind, photo.path)
+            errors.append({"path": photo.path, "error": f"Failed to copy {kind}: {copy_err}"})
+            logger.error("Failed to copy %s: %s (%s)", kind, photo.path, copy_err)
 
     return OrganizeResults(
         total=len(photos),
@@ -594,18 +790,21 @@ def organize_photos(photos: list[PhotoRecord], dup_groups: dict[str, list[str]],
         duplicates=len(dup_paths),
         errors=errors,
         errors_copied=errors_copied,
+        cloud_only=cloud_only,
         suspicious_dates=suspicious,
         dup_groups=dup_groups,
     )
 
 # ── Report Generation ──────────────────────────────────────────────────────────
 
-def build_report_html(results: OrganizeResults, output_root: Path, dry_run: bool, elapsed: float) -> str:
+def build_report_html(results: OrganizeResults, output_root: Path, dry_run: bool, elapsed: float,
+                       retry_path: Optional[Path] = None) -> str:
     """Render the HTML report from already-computed results."""
     total = results.total
     organized = results.organized
     dup_count = results.duplicates
     errors = results.errors
+    cloud_only = results.cloud_only
     suspicious = results.suspicious_dates
 
     html = f"""<!DOCTYPE html>
@@ -651,6 +850,7 @@ def build_report_html(results: OrganizeResults, output_root: Path, dry_run: bool
   <div class="stat"><div class="num">{len(suspicious):,}</div><div class="label">Suspicious dates</div></div>
   <div class="stat"><div class="num">{len(errors):,}</div><div class="label">Errors</div></div>
   <div class="stat"><div class="num">{results.errors_copied:,}</div><div class="label">Copied to errors/</div></div>
+  <div class="stat"><div class="num">{len(cloud_only):,}</div><div class="label">Cloud-only (not downloaded)</div></div>
   <div class="stat"><div class="num">{elapsed:.0f}s</div><div class="label">Processing time</div></div>
 </div>
 
@@ -658,6 +858,7 @@ def build_report_html(results: OrganizeResults, output_root: Path, dry_run: bool
 <p>Organized photos → <code>{output_root / "organized"}</code><br>
 Duplicates → <code>{output_root / "duplicates"}</code><br>
 Errored photos → <code>{output_root / "errors"}</code></p>
+{f"<p>Photos needing a retry (errors + cloud-only) → <code>{retry_path}</code> — use <code>--retry-file \"{retry_path}\"</code> on your next run.</p>" if retry_path else ""}
 """
 
     # Suspicious dates table
@@ -683,6 +884,21 @@ Errored photos → <code>{output_root / "errors"}</code></p>
             html += f"<tr><td colspan='2'><em>...and {len(errors) - REPORT_MAX_ERROR_ROWS} more</em></td></tr>"
         html += "</table>"
 
+    # Cloud-only (not-yet-downloaded) files table
+    if cloud_only:
+        html += "<h2>☁️ Cloud-Only (Not Downloaded)</h2>"
+        html += ("<p>These files are cloud-sync placeholders (e.g. OneDrive Files On-Demand) "
+                 "that haven't been downloaded to this machine yet, so their content couldn't "
+                 "be read. They were left untouched in the source folder. Sync them locally "
+                 "(e.g. right-click → \"Always keep on this device\") and re-run — "
+                 "<code>--retry-file</code> can reprocess just these.</p>")
+        html += "<table><tr><th>File</th></tr>"
+        for item in cloud_only[:REPORT_MAX_CLOUD_ONLY_ROWS]:
+            html += f"<tr><td>{Path(item).name}</td></tr>"
+        if len(cloud_only) > REPORT_MAX_CLOUD_ONLY_ROWS:
+            html += f"<tr><td><em>...and {len(cloud_only) - REPORT_MAX_CLOUD_ONLY_ROWS} more</em></td></tr>"
+        html += "</table>"
+
     # Duplicate groups
     if results.dup_groups:
         html += "<h2>🔁 Duplicate Groups (first 100)</h2>"
@@ -697,10 +913,11 @@ Errored photos → <code>{output_root / "errors"}</code></p>
     return html
 
 
-def generate_report(results: OrganizeResults, output_root: Path, dry_run: bool, elapsed: float) -> Path:
+def generate_report(results: OrganizeResults, output_root: Path, dry_run: bool, elapsed: float,
+                     retry_path: Optional[Path] = None) -> Path:
     """Write the HTML report to disk, atomically."""
     report_path = output_root / "photo_organizer_report.html"
-    html = build_report_html(results, output_root, dry_run, elapsed)
+    html = build_report_html(results, output_root, dry_run, elapsed, retry_path)
 
     output_root.mkdir(parents=True, exist_ok=True)
     # Write report atomically to avoid partial files
@@ -715,6 +932,24 @@ def generate_report(results: OrganizeResults, output_root: Path, dry_run: bool, 
             pass
     return report_path
 
+
+def write_retry_file(results: OrganizeResults, output_root: Path, run_id: str) -> Optional[Path]:
+    """
+    Write the photos that didn't get organized this run (errors + cloud-only
+    placeholders not yet downloaded) to <output>/retry_photos_<run_id>.txt, one
+    path per line, so a follow-up run can reprocess just these via
+    --retry-file instead of a full re-scan. Each run gets its own file (rather
+    than overwriting one shared name) so you can keep a history across runs
+    and choose which one to retry from. Returns None (writing nothing) if
+    there's nothing to retry.
+    """
+    paths = [item["path"] for item in results.errors] + list(results.cloud_only)
+    if not paths:
+        return None
+    retry_path = output_root / f"retry_photos_{run_id}.txt"
+    retry_path.write_text("\n".join(paths) + "\n", encoding="utf-8")
+    return retry_path
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
@@ -726,6 +961,10 @@ def parse_args() -> argparse.Namespace:
                         help="Perceptual hash distance threshold (default 4 = very strict; 0 = exact visual match only)")
     parser.add_argument("--workers", type=int, default=4, help="Parallel workers for hashing")
     parser.add_argument("--log-file", help="Path to log file (default: <output>/photo_organizer.log)")
+    parser.add_argument("--retry-file",
+                        help="Reprocess only the photos listed in this file (one path per line) "
+                             "instead of rescanning --source; see <output>/retry_photos.txt "
+                             "from a previous run")
     return parser.parse_args()
 
 
@@ -760,7 +999,7 @@ def validate_paths(source: Path, output: Path) -> tuple[Path, Path]:
 
 
 def print_summary(results: OrganizeResults, report_path: Path, log_path: Path,
-                   elapsed: float, dry_run: bool) -> None:
+                   retry_path: Optional[Path], elapsed: float, dry_run: bool) -> None:
     print(f"\n{Fore.GREEN}{'─' * 50}")
     print(f"{Fore.GREEN}✓ Done in {elapsed:.1f}s")
     print(f"  Total scanned:      {results.total:,}")
@@ -769,8 +1008,11 @@ def print_summary(results: OrganizeResults, report_path: Path, log_path: Path,
     print(f"  Suspicious dates:   {len(results.suspicious_dates):,}")
     print(f"  Errors:             {len(results.errors):,}")
     print(f"  Copied to errors/:  {results.errors_copied:,}")
+    print(f"  Cloud-only:         {len(results.cloud_only):,}")
     print(f"\n  📄 Report: {report_path}")
     print(f"  📝 Log:    {log_path}")
+    if retry_path:
+        print(f"  🔁 Retry:  {retry_path}  (rerun with --retry-file \"{retry_path}\")")
     if dry_run:
         print(f"\n{Fore.YELLOW}  ⚠  This was a DRY RUN. Re-run without --dry-run to copy files.")
 
@@ -786,16 +1028,30 @@ def main():
         print(f"{Fore.YELLOW}⚠  pillow-heif not installed — HEIC files will be skipped.")
         print(f"   Install with: pip install pillow-heif\n")
 
+    if not VIDEO_METADATA_SUPPORTED:
+        print(f"{Fore.YELLOW}⚠  hachoir not installed — video dates will use "
+              f"filename/filesystem only (no container metadata).")
+        print(f"   Install with: pip install hachoir\n")
+
     start_time = time.time()
+    run_id = datetime.fromtimestamp(start_time).strftime("%Y%m%d_%H%M%S")
 
     # ── 1. Scan ────────────────────────────────────────────────────────────────
-    print(f"{Fore.CYAN}Scanning {source} for photos...")
-    all_paths = scan_photos(source)
-    print(f"  Found {len(all_paths):,} image files")
+    if args.retry_file:
+        retry_file_path = Path(args.retry_file)
+        print(f"{Fore.CYAN}Loading retry list from {retry_file_path}...")
+        all_paths = load_retry_paths(retry_file_path)
+        print(f"  Loaded {len(all_paths):,} photos to retry")
+    else:
+        print(f"{Fore.CYAN}Scanning {source} for photos...")
+        all_paths = scan_photos(source)
+        print(f"  Found {len(all_paths):,} image files")
 
     if not all_paths:
         print(f"{Fore.YELLOW}No images found. Check your source path and supported extensions.")
         sys.exit(0)
+
+    check_disk_space(all_paths, output, args.dry_run)
 
     # ── 2. Process (parallel) ─────────────────────────────────────────────────
     print(f"\n{Fore.CYAN}Extracting dates & computing hashes ({args.workers} workers)...")
@@ -810,9 +1066,10 @@ def main():
     elapsed = time.time() - start_time
 
     # ── 5. Report ─────────────────────────────────────────────────────────────
-    report_path = generate_report(results, output, args.dry_run, elapsed)
+    retry_path = write_retry_file(results, output, run_id)
+    report_path = generate_report(results, output, args.dry_run, elapsed, retry_path)
 
-    print_summary(results, report_path, log_path, elapsed, args.dry_run)
+    print_summary(results, report_path, log_path, retry_path, elapsed, args.dry_run)
 
 
 if __name__ == "__main__":

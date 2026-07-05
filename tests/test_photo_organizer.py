@@ -159,9 +159,10 @@ def test_safe_copy_basic(tmp_path):
     src.write_bytes(b"hello world")
     dest = tmp_path / "out" / "src.jpg"
 
-    result = po.safe_copy(src, dest)
+    result, error = po.safe_copy(src, dest)
 
     assert result == dest
+    assert error is None
     assert dest.read_bytes() == b"hello world"
 
 
@@ -172,11 +173,13 @@ def test_safe_copy_collision_appends_suffix(tmp_path):
     src2.write_bytes(b"second")
 
     dest = tmp_path / "out" / "photo.jpg"
-    result1 = po.safe_copy(src1, dest)
-    result2 = po.safe_copy(src2, dest)
+    result1, error1 = po.safe_copy(src1, dest)
+    result2, error2 = po.safe_copy(src2, dest)
 
     assert result1 == dest
     assert result2 == tmp_path / "out" / "photo_1.jpg"
+    assert error1 is None
+    assert error2 is None
     assert result1.read_bytes() == b"first"
     assert result2.read_bytes() == b"second"
 
@@ -189,10 +192,24 @@ def test_safe_copy_never_overwrites_existing_file(tmp_path):
     src = tmp_path / "new.jpg"
     src.write_bytes(b"new content")
 
-    result = po.safe_copy(src, dest)
+    result, error = po.safe_copy(src, dest)
 
     assert result == tmp_path / "out" / "photo_1.jpg"
+    assert error is None
     assert dest.read_bytes() == b"do not touch"
+
+
+def test_safe_copy_returns_reason_when_dest_dir_is_a_file(tmp_path):
+    blocking_file = tmp_path / "not_a_dir"
+    blocking_file.write_bytes(b"x")
+    src = tmp_path / "src.jpg"
+    src.write_bytes(b"hello")
+    dest = blocking_file / "src.jpg"
+
+    result, error = po.safe_copy(src, dest)
+
+    assert result is None
+    assert error is not None
 
 
 # ── scan_photos symlink handling ────────────────────────────────────────────
@@ -345,3 +362,337 @@ def test_organize_photos_dry_run_does_not_copy_errored_photo(tmp_path):
 
     assert not (output / "errors").exists()
     assert results.errors_copied == 0
+
+
+def test_organize_photos_records_real_copy_failure_reason(tmp_path, monkeypatch):
+    record = make_record("/a/photo.jpg", file_hash="abc", date=datetime(2020, 1, 1))
+    monkeypatch.setattr(po, "safe_copy", lambda src, dest: (None, "disk full"))
+
+    results = po.organize_photos([record], {}, tmp_path / "out", dry_run=False)
+
+    assert len(results.errors) == 1
+    assert "disk full" in results.errors[0]["error"]
+
+
+# ── is_cloud_only_placeholder ────────────────────────────────────────────────
+
+class _FakeStat:
+    def __init__(self, attrs):
+        self.st_file_attributes = attrs
+
+
+def test_is_cloud_only_placeholder_detects_recall_bit():
+    assert po.is_cloud_only_placeholder(_FakeStat(po.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)) is True
+
+
+def test_is_cloud_only_placeholder_false_for_normal_file():
+    assert po.is_cloud_only_placeholder(_FakeStat(0)) is False
+
+
+def test_is_cloud_only_placeholder_false_when_attribute_missing():
+    class NoAttrs:
+        pass
+    assert po.is_cloud_only_placeholder(NoAttrs()) is False
+
+
+# ── process_photo cloud-only short-circuit ──────────────────────────────────
+
+def test_process_photo_marks_cloud_only_without_hashing(tmp_path, monkeypatch):
+    photo = tmp_path / "cloud.jpg"
+    photo.write_bytes(b"fake image data")
+
+    class FakeCloudStat:
+        st_size = 123
+        st_file_attributes = po.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+
+    monkeypatch.setattr(po.Path, "stat", lambda self: FakeCloudStat())
+
+    record = po.process_photo(photo)
+
+    assert record.cloud_only is True
+    assert record.error is None
+    assert record.file_hash is None
+
+
+# ── organize_photos cloud-only handling ─────────────────────────────────────
+
+def test_organize_photos_skips_cloud_only_without_copying(tmp_path):
+    record = make_record("/a/cloud.jpg")
+    record.cloud_only = True
+    output = tmp_path / "out"
+
+    results = po.organize_photos([record], {}, output, dry_run=False)
+
+    assert results.cloud_only == ["/a/cloud.jpg"]
+    assert results.errors == []
+    assert not (output / "errors").exists()
+    assert not (output / "organized").exists()
+
+
+def test_organize_photos_excludes_cloud_only_from_suspicious_dates(tmp_path):
+    # Cloud-only photos never reach get_photo_date(), so date stays None —
+    # they must not also show up in the suspicious-dates bucket.
+    record = make_record("/a/cloud.jpg")
+    record.cloud_only = True
+    assert record.date is None
+
+    results = po.organize_photos([record], {}, tmp_path / "out", dry_run=False)
+
+    assert results.suspicious_dates == []
+    assert results.cloud_only == ["/a/cloud.jpg"]
+
+
+# ── retry file round-trip ────────────────────────────────────────────────────
+
+def test_write_retry_file_and_load_retry_paths_roundtrip(tmp_path):
+    results = po.OrganizeResults(
+        total=2, organized=0, duplicates=0,
+        errors=[{"path": "/a/broken.jpg", "error": "boom"}],
+        cloud_only=["/a/cloud.jpg"],
+    )
+
+    retry_path = po.write_retry_file(results, tmp_path, run_id="20260704_101423")
+
+    assert retry_path == tmp_path / "retry_photos_20260704_101423.txt"
+    assert po.load_retry_paths(retry_path) == [Path("/a/broken.jpg"), Path("/a/cloud.jpg")]
+
+
+def test_write_retry_file_returns_none_when_nothing_to_retry(tmp_path):
+    results = po.OrganizeResults(total=1, organized=1, duplicates=0)
+    assert po.write_retry_file(results, tmp_path, run_id="20260704_101423") is None
+
+
+def test_write_retry_file_uses_distinct_names_per_run(tmp_path):
+    results = po.OrganizeResults(
+        total=1, organized=0, duplicates=0,
+        errors=[{"path": "/a/broken.jpg", "error": "boom"}],
+    )
+
+    first = po.write_retry_file(results, tmp_path, run_id="20260704_101423")
+    second = po.write_retry_file(results, tmp_path, run_id="20260704_111500")
+
+    assert first != second
+    assert first.exists() and second.exists()
+
+
+# ── estimate_required_bytes / check_disk_space ──────────────────────────────
+
+def test_estimate_required_bytes_sums_regular_files(tmp_path):
+    a = tmp_path / "a.jpg"
+    a.write_bytes(b"x" * 100)
+    b = tmp_path / "b.jpg"
+    b.write_bytes(b"y" * 250)
+
+    needed, cloud_only = po.estimate_required_bytes([a, b])
+
+    assert needed == 350
+    assert cloud_only == 0
+
+
+def test_estimate_required_bytes_separates_cloud_only(tmp_path, monkeypatch):
+    normal = tmp_path / "normal.jpg"
+    normal.write_bytes(b"x" * 100)
+    cloud = tmp_path / "cloud.jpg"
+    cloud.write_bytes(b"y" * 50)
+
+    real_stat = Path.stat
+
+    def fake_stat(self, *args, **kwargs):
+        st = real_stat(self, *args, **kwargs)
+        if self.name == "cloud.jpg":
+            class FakeStat:
+                st_size = st.st_size
+                st_file_attributes = po.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+            return FakeStat()
+        return st
+
+    monkeypatch.setattr(po.Path, "stat", fake_stat)
+
+    needed, cloud_only = po.estimate_required_bytes([normal, cloud])
+
+    assert needed == 100
+    assert cloud_only == 50
+
+
+def test_estimate_required_bytes_skips_missing_files(tmp_path):
+    missing = tmp_path / "does_not_exist.jpg"
+    needed, cloud_only = po.estimate_required_bytes([missing])
+    assert needed == 0
+    assert cloud_only == 0
+
+
+def test_check_disk_space_passes_when_enough_free(tmp_path, monkeypatch):
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(b"x" * 100)
+
+    class FakeUsage:
+        free = 10 * 1024 ** 3
+
+    monkeypatch.setattr(po.shutil, "disk_usage", lambda path: FakeUsage())
+
+    po.check_disk_space([photo], tmp_path / "out", dry_run=False)  # should not raise
+
+
+def test_check_disk_space_exits_when_insufficient_and_not_dry_run(tmp_path, monkeypatch):
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(b"x" * 100)
+
+    monkeypatch.setattr(po, "estimate_required_bytes", lambda paths: (5 * 1024 ** 3, 0))
+
+    class FakeUsage:
+        free = 0
+
+    monkeypatch.setattr(po.shutil, "disk_usage", lambda path: FakeUsage())
+
+    try:
+        po.check_disk_space([photo], tmp_path / "out", dry_run=False)
+        assert False, "expected SystemExit"
+    except SystemExit as e:
+        assert e.code == 1
+
+
+def test_check_disk_space_warns_but_does_not_exit_during_dry_run(tmp_path, monkeypatch):
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(b"x" * 100)
+
+    monkeypatch.setattr(po, "estimate_required_bytes", lambda paths: (5 * 1024 ** 3, 0))
+
+    class FakeUsage:
+        free = 0
+
+    monkeypatch.setattr(po.shutil, "disk_usage", lambda path: FakeUsage())
+
+    po.check_disk_space([photo], tmp_path / "out", dry_run=True)  # should not raise
+
+
+# ── video support ────────────────────────────────────────────────────────────
+
+def test_is_video_detects_supported_extensions():
+    assert po.is_video(Path("clip.mp4")) is True
+    assert po.is_video(Path("clip.MOV")) is True
+    assert po.is_video(Path("photo.jpg")) is False
+
+
+def test_scan_photos_finds_video_files(tmp_path):
+    (tmp_path / "clip.mp4").write_bytes(b"fake video data")
+    (tmp_path / "photo.jpg").write_bytes(b"fake image data")
+    (tmp_path / "notes.txt").write_bytes(b"not media")
+
+    found = po.scan_photos(tmp_path)
+
+    names = {p.name for p in found}
+    assert names == {"clip.mp4", "photo.jpg"}
+
+
+def test_process_photo_skips_hashing_for_video_but_still_gets_a_date(tmp_path):
+    video = tmp_path / "VID_20190704_120000.mp4"
+    video.write_bytes(b"fake video data")
+
+    record = po.process_photo(video)
+
+    assert record.error is None
+    assert record.file_hash is None
+    assert record.phash is None
+    assert record.date == datetime(2019, 7, 4, 12, 0, 0)
+    assert record.date_source == "filename"
+
+
+# ── get_video_date ───────────────────────────────────────────────────────────
+
+class _FakeVideoStream:
+    def close(self):
+        pass
+
+
+class _FakeVideoParser:
+    stream = _FakeVideoStream()
+
+
+def _fake_metadata(creation_date):
+    class FakeMetadata:
+        def get(self, key, default=None):
+            if key == "creation_date":
+                return creation_date
+            return default
+    return FakeMetadata()
+
+
+def test_get_video_date_prefers_container_metadata(tmp_path, monkeypatch):
+    # Filename has no date at all, so metadata is the only possible source.
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake video bytes")
+
+    monkeypatch.setattr(po, "VIDEO_METADATA_SUPPORTED", True)
+    monkeypatch.setattr(po, "createParser", lambda path: _FakeVideoParser())
+    monkeypatch.setattr(po, "extractMetadata",
+                         lambda parser: _fake_metadata(datetime(2022, 4, 7, 17, 48, 1)))
+
+    dt, source = po.get_video_date(video)
+
+    assert dt == datetime(2022, 4, 7, 17, 48, 1)
+    assert source == "video metadata"
+
+
+def test_get_video_date_falls_back_to_filename_when_metadata_unavailable(tmp_path, monkeypatch):
+    video = tmp_path / "VID_20190704_120000.mp4"
+    video.write_bytes(b"fake video bytes")
+
+    monkeypatch.setattr(po, "VIDEO_METADATA_SUPPORTED", True)
+    monkeypatch.setattr(po, "createParser", lambda path: None)  # unparseable
+
+    dt, source = po.get_video_date(video)
+
+    assert dt == datetime(2019, 7, 4, 12, 0, 0)
+    assert source == "filename"
+
+
+def test_get_video_date_prefers_filesystem_over_suspicious_metadata(tmp_path, monkeypatch):
+    video = tmp_path / "clip.mp4"  # no filename date
+    video.write_bytes(b"fake video bytes")
+
+    monkeypatch.setattr(po, "VIDEO_METADATA_SUPPORTED", True)
+    monkeypatch.setattr(po, "createParser", lambda path: _FakeVideoParser())
+    monkeypatch.setattr(po, "extractMetadata",
+                         lambda parser: _fake_metadata(datetime(1970, 1, 1)))  # suspicious
+
+    dt, source = po.get_video_date(video)
+
+    assert dt is not None
+    assert "filesystem" in source
+    assert "video metadata suspicious" in source
+
+
+def test_get_video_date_skips_metadata_lookup_when_hachoir_not_installed(tmp_path, monkeypatch):
+    video = tmp_path / "VID_20190704_120000.mp4"
+    video.write_bytes(b"fake video bytes")
+
+    monkeypatch.setattr(po, "VIDEO_METADATA_SUPPORTED", False)
+
+    dt, source = po.get_video_date(video)
+
+    assert dt == datetime(2019, 7, 4, 12, 0, 0)
+    assert source == "filename"
+
+
+def test_find_duplicates_never_groups_identical_videos():
+    # Same content, same size, but videos never get a file_hash/phash, so
+    # find_duplicates() must not group them even though the bytes match.
+    a = make_record("/a/clip1.mp4", date=datetime(2020, 1, 1))
+    b = make_record("/a/clip2.mp4", date=datetime(2020, 1, 1))
+
+    dup_groups = po.find_duplicates([a, b], hash_threshold=4)
+
+    assert dup_groups == {}
+
+
+def test_organize_photos_organizes_video_like_a_photo(tmp_path):
+    video_src = tmp_path / "VID_20190704_120000.mp4"
+    video_src.write_bytes(b"fake video data")
+    record = make_record(str(video_src), date=datetime(2019, 7, 4))
+
+    output = tmp_path / "out"
+    results = po.organize_photos([record], {}, output, dry_run=False)
+
+    assert results.organized == 1
+    assert results.duplicates == 0
+    assert (output / "organized" / "2019" / "07" / "VID_20190704_120000.mp4").exists()

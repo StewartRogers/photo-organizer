@@ -4,3 +4,4 @@ imagehash
 tqdm
 colorama
 pillow-heif
+hachoir
