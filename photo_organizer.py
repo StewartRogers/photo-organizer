@@ -30,6 +30,7 @@ Optional flags:
                        (default: 1.0)
     --archive-source   After a fully successful run, zip --source in chunks
                        (written to --source's own root; see --archive-chunk-gb)
+    --archive-only     Skip scanning/organizing and just archive --source now
 """
 
 import os
@@ -1163,7 +1164,13 @@ def parse_args() -> argparse.Namespace:
                              "own root (archive_<run_id>_NNNN.zip). --source's existing files are "
                              "never modified; skipped under --dry-run or if the run wasn't clean.")
     parser.add_argument("--archive-chunk-gb", type=float, default=1.0,
-                        help="Target size per zip chunk when using --archive-source (default: 1.0)")
+                        help="Target size per zip chunk when using --archive-source or "
+                             "--archive-only (default: 1.0)")
+    parser.add_argument("--archive-only", action="store_true",
+                        help="Skip scanning/organizing entirely and just archive --source now "
+                             "(e.g. if you forgot --archive-source on an already-successful run). "
+                             "--output is still required (used for the log file) but isn't written "
+                             "to otherwise. Skipped under --dry-run.")
     return parser.parse_args()
 
 
@@ -1234,6 +1241,23 @@ def main():
 
     start_time = time.time()
     run_id = datetime.fromtimestamp(start_time).strftime("%Y%m%d_%H%M%S")
+
+    if args.archive_only:
+        if args.dry_run:
+            print(f"{Fore.YELLOW}⚠  Skipping --archive-only: dry runs never create real output.")
+            return
+        print(f"{Fore.CYAN}Archiving --source into ~{args.archive_chunk_gb:.2f} GB zip "
+              f"chunks (written to {source})...")
+        zip_paths, problems = archive_source(source, args.archive_chunk_gb, run_id)
+        elapsed = time.time() - start_time
+        print(f"{Fore.GREEN}✓ Created {len(zip_paths):,} verified zip file(s) in {source} "
+              f"({elapsed:.1f}s)")
+        if problems:
+            print(f"{Fore.RED}✗ {len(problems):,} problem(s) during archiving (see log):")
+            for path_str, reason in problems:
+                logger.error("Archive problem for %s: %s", path_str, reason)
+                print(f"    {path_str}: {reason}")
+        return
 
     # ── 1. Scan ────────────────────────────────────────────────────────────────
     if args.retry_file:

@@ -116,8 +116,12 @@ HTML report at the end.
   own root. Never splits a single file across chunks. Each finished chunk is
   verified immediately via `zipfile.testzip()` (CRC check, not just "does it
   open") in `_verify_zip()`; failures are collected and reported rather than
-  trusted silently. Only invoked from `main()` when the run had zero errors
-  and zero cloud-only leftovers, and never under `--dry-run`.
+  trusted silently. Invoked from `main()` two ways: automatically via
+  `--archive-source` when the run had zero errors and zero cloud-only
+  leftovers, or directly via `--archive-only` (an early-return in `main()`
+  right after `run_id` is computed, before scanning starts at all — for
+  archiving a `--source` that was already fully organized in a previous
+  run). Never under `--dry-run` either way.
 - `validate_paths()` — resolves `--source`/`--output` to absolute paths and
   rejects configs where one is nested inside the other.
 - `main()` — now a thin orchestrator: parse args → validate paths → scan (or
@@ -275,6 +279,16 @@ user-driven design decisions worth remembering if this comes up again:
 originals are never deleted/modified (matches the tool's existing copy-only
 guarantee — this only *adds* files), and it's opt-in via a flag rather than
 automatic after every clean run.
+
+Follow-up same day: user ran a full pass without `--archive-source`, then
+wanted to archive afterward without re-running the (multi-hour) scan/process
+pipeline. Added `--archive-only`: an early-return in `main()` right after
+`run_id` is computed — calls `archive_source()` directly and exits, skipping
+scan/process/dedup/organize entirely. `--output` stays required (still used
+for the log file) but nothing is written there in this mode. Same
+`--dry-run` skip as `--archive-source`; deliberately does *not* check for a
+prior clean run, since there's no `results` object in this code path at all
+— archiving-only is the user's explicit call, taken at face value.
 
 ## Remaining known tradeoffs (not bugs)
 

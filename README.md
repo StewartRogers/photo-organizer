@@ -85,7 +85,8 @@ python photo_organizer.py --source "C:\Photos\My Pictures" --output "C:\Photos\O
 | `--retry-file` | none | Reprocess only the photos listed in this file (one path per line) instead of rescanning `--source` — see `<output>/retry_photos.txt` from a previous run |
 | `--max-cloud-only-gb` | 1.0 | Abort before processing if more than this many GB of source files are still cloud-only / not downloaded yet |
 | `--archive-source` | off | After a fully successful run, zip `--source` into chunks (written to `--source`'s own root) |
-| `--archive-chunk-gb` | 1.0 | Target size per zip chunk when using `--archive-source` |
+| `--archive-chunk-gb` | 1.0 | Target size per zip chunk when using `--archive-source` or `--archive-only` |
+| `--archive-only` | off | Skip scanning/organizing entirely and just archive `--source` now (e.g. forgot `--archive-source` earlier) |
 
 ---
 
@@ -186,6 +187,16 @@ packs everything under `--source` into a sequence of independent zip files
   existing `archive_*.zip` files are skipped when scanning `--source`.
 - Skipped (with a message, not silently) under `--dry-run`, or if the run had
   any errors or cloud-only files left over — resolve those and re-run first.
+
+**Forgot to pass `--archive-source` on a run that already finished successfully?**
+Use `--archive-only` instead of re-running the whole scan/organize pipeline —
+it skips straight to archiving `--source` with the same chunking/verification
+behavior described above. `--output` is still required (it's used for the log
+file) but nothing is written there. Also skipped under `--dry-run`.
+
+```
+python photo_organizer.py --source "C:\Photos\My Pictures" --output "C:\Photos\Organized" --archive-only
+```
 
 ---
 
