@@ -214,19 +214,24 @@ def test_safe_copy_returns_reason_when_dest_dir_is_a_file(tmp_path):
 
 # ── scan_photos symlink handling ────────────────────────────────────────────
 
-def test_scan_photos_skips_symlinked_files(tmp_path):
+def test_scan_photos_skips_symlinked_files(tmp_path, monkeypatch):
+    # Creating a real symlink requires Developer Mode / admin elevation on
+    # Windows (SeCreateSymbolicLinkPrivilege) — not available in every dev/CI
+    # environment. scan_photos()'s entire symlink guard is a Path.is_symlink()
+    # check, so simulating that directly tests the real protective logic
+    # without depending on OS-level symlink-creation privileges anywhere.
     source = tmp_path / "source"
     source.mkdir()
-    real_target_dir = tmp_path / "outside"
-    real_target_dir.mkdir()
-    outside_file = real_target_dir / "secret.jpg"
-    outside_file.write_bytes(b"not a real photo")
 
     inside_file = source / "real.jpg"
     inside_file.write_bytes(b"real photo")
 
     symlink_file = source / "link.jpg"
-    symlink_file.symlink_to(outside_file)
+    symlink_file.write_bytes(b"stand-in for a symlink pointing outside source")
+
+    real_is_symlink = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink",
+                         lambda self: self == symlink_file or real_is_symlink(self))
 
     found = po.scan_photos(source)
 
@@ -234,14 +239,19 @@ def test_scan_photos_skips_symlinked_files(tmp_path):
     assert symlink_file not in found
 
 
-def test_scan_photos_skips_symlinked_directories(tmp_path):
+def test_scan_photos_skips_symlinked_directories(tmp_path, monkeypatch):
+    # See test_scan_photos_skips_symlinked_files: simulates a symlinked
+    # directory via Path.is_symlink() rather than requiring real
+    # symlink-creation privileges.
     source = tmp_path / "source"
     source.mkdir()
-    outside_dir = tmp_path / "outside"
-    outside_dir.mkdir()
-    (outside_dir / "secret.jpg").write_bytes(b"secret")
+    linked_dir = source / "linked_dir"
+    linked_dir.mkdir()
+    (linked_dir / "secret.jpg").write_bytes(b"secret")
 
-    (source / "linked_dir").symlink_to(outside_dir, target_is_directory=True)
+    real_is_symlink = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink",
+                         lambda self: self == linked_dir or real_is_symlink(self))
 
     found = po.scan_photos(source)
 
@@ -414,6 +424,53 @@ def test_process_photo_marks_cloud_only_without_hashing(tmp_path, monkeypatch):
     assert record.file_hash is None
 
 
+def test_hydrate_cloud_only_file_reads_successfully(tmp_path):
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(b"some content")
+
+    assert po.hydrate_cloud_only_file(photo) is True
+
+
+def test_hydrate_cloud_only_file_returns_false_on_read_failure(tmp_path):
+    missing = tmp_path / "does_not_exist.jpg"
+    assert po.hydrate_cloud_only_file(missing) is False
+
+
+def test_process_photo_hydrates_and_processes_cloud_only_file_when_requested(tmp_path, monkeypatch):
+    photo = tmp_path / "IMG_20190704_120000.jpg"
+    photo.write_bytes(b"fake image data")
+
+    class FakeCloudStat:
+        st_size = 123
+        st_file_attributes = po.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+
+    monkeypatch.setattr(po.Path, "stat", lambda self: FakeCloudStat())
+    monkeypatch.setattr(po, "hydrate_cloud_only_file", lambda path: True)
+
+    record = po.process_photo(photo, hydrate=True)
+
+    assert record.cloud_only is False
+    assert record.error is None
+    assert record.date == datetime(2019, 7, 4, 12, 0, 0)  # normal processing ran
+
+
+def test_process_photo_falls_back_to_cloud_only_when_hydration_fails(tmp_path, monkeypatch):
+    photo = tmp_path / "cloud.jpg"
+    photo.write_bytes(b"fake image data")
+
+    class FakeCloudStat:
+        st_size = 123
+        st_file_attributes = po.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+
+    monkeypatch.setattr(po.Path, "stat", lambda self: FakeCloudStat())
+    monkeypatch.setattr(po, "hydrate_cloud_only_file", lambda path: False)
+
+    record = po.process_photo(photo, hydrate=True)
+
+    assert record.cloud_only is True
+    assert record.file_hash is None
+
+
 # ── organize_photos cloud-only handling ─────────────────────────────────────
 
 def test_organize_photos_skips_cloud_only_without_copying(tmp_path):
@@ -565,6 +622,57 @@ def test_check_disk_space_warns_but_does_not_exit_during_dry_run(tmp_path, monke
     po.check_disk_space([photo], tmp_path / "out", dry_run=True)  # should not raise
 
 
+# ── check_cloud_only_backlog ─────────────────────────────────────────────────
+
+def test_check_cloud_only_backlog_passes_when_under_threshold(tmp_path, monkeypatch):
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(b"x" * 100)
+
+    monkeypatch.setattr(po, "estimate_required_bytes", lambda paths: (100, 0))
+
+    assert po.check_cloud_only_backlog([photo], max_cloud_only_gb=1.0, dry_run=False) is False
+
+
+def test_check_cloud_only_backlog_returns_true_to_hydrate_small_backlog(tmp_path, monkeypatch):
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(b"x" * 100)
+
+    monkeypatch.setattr(po, "estimate_required_bytes", lambda paths: (0, 1024))  # small, but > 0
+
+    assert po.check_cloud_only_backlog([photo], max_cloud_only_gb=1.0, dry_run=False) is True
+
+
+def test_check_cloud_only_backlog_never_hydrates_during_dry_run(tmp_path, monkeypatch):
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(b"x" * 100)
+
+    monkeypatch.setattr(po, "estimate_required_bytes", lambda paths: (0, 1024))  # small, but > 0
+
+    assert po.check_cloud_only_backlog([photo], max_cloud_only_gb=1.0, dry_run=True) is False
+
+
+def test_check_cloud_only_backlog_exits_when_over_threshold_and_not_dry_run(tmp_path, monkeypatch):
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(b"x" * 100)
+
+    monkeypatch.setattr(po, "estimate_required_bytes", lambda paths: (0, 5 * 1024 ** 3))
+
+    try:
+        po.check_cloud_only_backlog([photo], max_cloud_only_gb=1.0, dry_run=False)
+        assert False, "expected SystemExit"
+    except SystemExit as e:
+        assert e.code == 1
+
+
+def test_check_cloud_only_backlog_warns_but_does_not_exit_during_dry_run(tmp_path, monkeypatch):
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(b"x" * 100)
+
+    monkeypatch.setattr(po, "estimate_required_bytes", lambda paths: (0, 5 * 1024 ** 3))
+
+    assert po.check_cloud_only_backlog([photo], max_cloud_only_gb=1.0, dry_run=True) is False
+
+
 # ── video support ────────────────────────────────────────────────────────────
 
 def test_is_video_detects_supported_extensions():
@@ -696,3 +804,100 @@ def test_organize_photos_organizes_video_like_a_photo(tmp_path):
     assert results.organized == 1
     assert results.duplicates == 0
     assert (output / "organized" / "2019" / "07" / "VID_20190704_120000.mp4").exists()
+
+
+# ── archive_source / _verify_zip ─────────────────────────────────────────────
+
+def test_verify_zip_returns_none_for_valid_zip(tmp_path):
+    import zipfile
+    zip_path = tmp_path / "valid.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("hello.txt", b"hello world")
+
+    assert po._verify_zip(zip_path) is None
+
+
+def test_verify_zip_detects_corruption(tmp_path):
+    import zipfile
+    zip_path = tmp_path / "corrupt.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("hello.txt", b"hello world" * 100)
+
+    # Flip some bytes in the middle of the file's raw data to break its CRC
+    # (or, depending on offset, the archive structure itself) — either way
+    # _verify_zip() must report it, not silently pass.
+    data = bytearray(zip_path.read_bytes())
+    mid = len(data) // 2
+    data[mid] = data[mid] ^ 0xFF
+    zip_path.write_bytes(bytes(data))
+
+    assert po._verify_zip(zip_path) is not None
+
+
+def test_archive_source_creates_verified_zip_with_relative_paths(tmp_path):
+    source = tmp_path / "source"
+    (source / "sub").mkdir(parents=True)
+    (source / "a.jpg").write_bytes(b"photo a")
+    (source / "sub" / "b.jpg").write_bytes(b"photo b")
+
+    zip_paths, problems = po.archive_source(source, chunk_gb=1.0, run_id="20260705_120000")
+
+    assert problems == []
+    assert len(zip_paths) == 1
+    assert zip_paths[0].parent == source
+    assert zip_paths[0].name == "archive_20260705_120000_0001.zip"
+
+    import zipfile
+    with zipfile.ZipFile(zip_paths[0]) as zf:
+        names = set(zf.namelist())
+        assert "a.jpg" in names
+        assert str(Path("sub") / "b.jpg") in names or "sub/b.jpg" in names
+        assert zf.read("a.jpg") == b"photo a"
+
+
+def test_archive_source_splits_into_multiple_chunks_by_size(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    for i in range(5):
+        (source / f"file_{i}.jpg").write_bytes(b"x" * 1000)
+
+    # ~1000 bytes/file; a ~2500 byte chunk should force multiple archives
+    zip_paths, problems = po.archive_source(source, chunk_gb=2500 / (1024 ** 3), run_id="run1")
+
+    assert problems == []
+    assert len(zip_paths) > 1
+
+    import zipfile
+    total_members = 0
+    for zp in zip_paths:
+        with zipfile.ZipFile(zp) as zf:
+            assert zf.testzip() is None
+            total_members += len(zf.namelist())
+    assert total_members == 5
+
+
+def test_archive_source_does_not_reinclude_existing_archives(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "photo.jpg").write_bytes(b"photo")
+    (source / "archive_oldrun_0001.zip").write_bytes(b"pretend old archive")
+
+    zip_paths, problems = po.archive_source(source, chunk_gb=1.0, run_id="newrun")
+
+    assert problems == []
+    import zipfile
+    with zipfile.ZipFile(zip_paths[0]) as zf:
+        assert zf.namelist() == ["photo.jpg"]
+
+
+def test_archive_source_reports_verification_failures(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "photo.jpg").write_bytes(b"photo")
+
+    monkeypatch.setattr(po, "_verify_zip", lambda path: "simulated corruption")
+
+    zip_paths, problems = po.archive_source(source, chunk_gb=1.0, run_id="run1")
+
+    assert len(zip_paths) == 1
+    assert problems == [(str(zip_paths[0]), "simulated corruption")]

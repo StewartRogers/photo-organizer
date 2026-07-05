@@ -90,13 +90,39 @@ HTML report at the end.
   (to `duplicates/`), so total destination usage barely depends on the
   duplicate ratio. Exits before processing starts if space is short, unless
   `--dry-run` (warns only, since dry runs never copy anything).
+- `check_cloud_only_backlog()` — separate pre-flight check (also via
+  `estimate_required_bytes()`), same place in `main()`. If more than
+  `--max-cloud-only-gb` (default 1.0) of source content is still cloud-only,
+  exits and asks the user to wait for the sync to progress rather than
+  running a pass that would barely organize anything — same
+  exit-unless-`--dry-run` pattern as `check_disk_space()`. Otherwise returns
+  `True`/`False`: whether the backlog is small enough to actively hydrate
+  cloud-only files during this run rather than skip them (always `False`
+  under `--dry-run`). Threaded through `process_all_photos()` →
+  `process_photo(path, hydrate=...)`.
+- `hydrate_cloud_only_file()` — forces a cloud-only placeholder to download by
+  reading it (OneDrive hydrates on any real read once its provider is
+  healthy — see the OneDrive incident below). `process_photo()` calls this
+  when `hydrate=True` instead of immediately skipping a cloud-only file; on
+  success it falls through to normal processing (date/hash) exactly as if
+  the file had been local all along, on failure it falls back to the
+  existing `cloud_only=True` skip.
 - `build_report_html()` / `generate_report()` — HTML templating is separated from
   the atomic-write-to-disk step.
+- `archive_source()` / `_verify_zip()` — optional post-run step
+  (`--archive-source`, opt-in): walks `--source` (skipping symlinks and its
+  own prior `archive_*.zip` output) and greedily packs files into
+  `~--archive-chunk-gb`-sized `ZIP_STORED` chunks written into `--source`'s
+  own root. Never splits a single file across chunks. Each finished chunk is
+  verified immediately via `zipfile.testzip()` (CRC check, not just "does it
+  open") in `_verify_zip()`; failures are collected and reported rather than
+  trusted silently. Only invoked from `main()` when the run had zero errors
+  and zero cloud-only leftovers, and never under `--dry-run`.
 - `validate_paths()` — resolves `--source`/`--output` to absolute paths and
   rejects configs where one is nested inside the other.
 - `main()` — now a thin orchestrator: parse args → validate paths → scan (or
   load `--retry-file`) → process → dedup → organize → write retry file →
-  report → print summary.
+  report → print summary → optional source archive.
 
 ## Fixed in the 2026-07-03 review pass
 
@@ -194,6 +220,61 @@ call: "no need to do any duplicate checks" for videos).
   is needed to silence its own console warning spam on unparseable files;
   `parser.stream.close()` after `extractMetadata()` to avoid leaking file
   handles across thousands of videos in the thread pool).
+
+## Added in the 2026-07-04 cloud-only-backlog pass
+
+While the OneDrive library was still mid-sync (thousands of files cloud-only),
+two more things came up:
+
+- Added `check_cloud_only_backlog()` + `--max-cloud-only-gb` (default 1.0): if
+  more source content than that is still cloud-only, exit before the
+  expensive process/hash pass and ask the user to wait for the sync to
+  progress, rather than running a pass that mostly just repopulates the
+  retry list. Same `estimate_required_bytes()` used by `check_disk_space()`;
+  same exit-unless-`--dry-run` pattern.
+- **Found and fixed a real, pre-existing bug while manually testing the
+  above**: any `print()` of a non-ASCII character (`⚠`, `✓`, `❌`, emoji —
+  used throughout the console output) raises `UnicodeEncodeError` and crashes
+  the whole run on a non-UTF-8 console (e.g. legacy Windows `cp1252`,
+  reproduced when invoking the script outside a real UTF-8-configured
+  terminal). Fixed by reconfiguring `sys.stdout`/`sys.stderr` to UTF-8 with
+  `errors="replace"` at the top of the file, before colorama's `init()` wraps
+  them — this was latent in the tool well before this session, not something
+  introduced by the cloud-only-backlog check itself.
+
+## Fixed in the 2026-07-05 follow-up (auto-hydrate small backlogs)
+
+`check_cloud_only_backlog()` originally only gated whether to *abort* — under
+its threshold it just silently allowed the run to proceed, and cloud-only
+files were still always skipped into the retry list regardless of how few
+there were. That defeated the point: if the backlog is small enough not to
+abort over, it's also small enough to just download inline instead of making
+the user do a separate `--retry-file` pass later. Fixed:
+
+- `check_cloud_only_backlog()` now returns `bool` (`True`/`False`) instead of
+  `None` — whether the backlog is small enough to hydrate rather than skip.
+  Always `False` under `--dry-run` (a dry run must never trigger a download).
+- Added `hydrate_cloud_only_file()` (reads the file to force download,
+  returns whether it succeeded) and threaded a `hydrate` flag through
+  `process_all_photos()` → `process_photo()`: when `hydrate=True` and a
+  cloud-only file is encountered, `process_photo()` calls this instead of
+  immediately skipping, falling through to normal date/hash processing on
+  success or the existing `cloud_only=True` skip on failure.
+- Verified against real leftover cloud-only files from an actual run (not
+  just mocks) — a video whose backlog was under threshold got hydrated,
+  dated via its own container metadata, and confirmed no longer cloud-only
+  afterward.
+
+## Added in the 2026-07-05 archive-source pass
+
+Added `--archive-source` (see `archive_source()`/`_verify_zip()` in Key
+Functions): after a fully successful run, packs `--source` into chunked,
+CRC-verified `ZIP_STORED` zip files written into `--source`'s own root
+(explicit user request — a placement choice, not `--output`). Two
+user-driven design decisions worth remembering if this comes up again:
+originals are never deleted/modified (matches the tool's existing copy-only
+guarantee — this only *adds* files), and it's opt-in via a flag rather than
+automatic after every clean run.
 
 ## Remaining known tradeoffs (not bugs)
 

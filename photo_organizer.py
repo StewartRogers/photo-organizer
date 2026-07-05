@@ -26,6 +26,10 @@ Optional flags:
     --log-file         Path to log file (default: <output>/photo_organizer.log)
     --retry-file       Reprocess only the photos listed in this file (see
                        <output>/retry_photos.txt from a previous run)
+    --max-cloud-only-gb  Abort if more than this many GB are still cloud-only
+                       (default: 1.0)
+    --archive-source   After a fully successful run, zip --source in chunks
+                       (written to --source's own root; see --archive-chunk-gb)
 """
 
 import os
@@ -36,6 +40,7 @@ import argparse
 import logging
 import re
 import warnings
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +48,15 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 import time
+
+# Console output uses non-ASCII characters (⚠, ✓, ❌, emoji, ...). On a
+# non-UTF-8 console (e.g. legacy Windows cp1252) this would otherwise raise
+# UnicodeEncodeError and crash the run; reconfigure to UTF-8, replacing any
+# character an unusual terminal still can't render instead of crashing.
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 try:
     from PIL import Image, UnidentifiedImageError
@@ -417,16 +431,45 @@ def is_cloud_only_placeholder(stat_result: os.stat_result) -> bool:
     return bool(attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
 
 
-def process_photo(path: Path) -> PhotoRecord:
-    """Extract all metadata for one photo. Designed to run in a thread pool."""
+def hydrate_cloud_only_file(path: Path) -> bool:
+    """
+    Force a cloud-sync placeholder's content to download by reading it (e.g.
+    OneDrive Files On-Demand hydrates on any real read, once its cloud file
+    provider is healthy — verified live during the 2026-07-04 OneDrive
+    incident, see CLAUDE.md). Returns True if the read succeeded (the file is
+    now fully local), False otherwise (provider unavailable, etc.) — callers
+    should fall back to treating the file as still cloud-only on False.
+    """
+    try:
+        with open(path, "rb") as f:
+            while f.read(FILE_READ_CHUNK_SIZE):
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def process_photo(path: Path, hydrate: bool = False) -> PhotoRecord:
+    """
+    Extract all metadata for one photo. Designed to run in a thread pool.
+
+    `hydrate`: if True, actively download a cloud-only file (via
+    hydrate_cloud_only_file()) and fold it into normal processing instead of
+    skipping it — used when check_cloud_only_backlog() judged the backlog
+    small enough to be worth downloading inline rather than deferring to a
+    future --retry-file run.
+    """
     record = PhotoRecord(path=str(path))
     try:
         stat = path.stat()
         record.size = stat.st_size
 
         if is_cloud_only_placeholder(stat):
-            record.cloud_only = True
-            return record
+            if not (hydrate and hydrate_cloud_only_file(path)):
+                record.cloud_only = True
+                return record
+            # Hydration succeeded — the file is now fully local; fall
+            # through and process it exactly like any other photo/video.
 
         video = is_video(path)
         dt, source = get_video_date(path) if video else get_photo_date(path)
@@ -714,13 +757,51 @@ def check_disk_space(paths: list[Path], output: Path, dry_run: bool) -> None:
                   f"Free up space or point --output at a different drive, then retry.")
             sys.exit(1)
 
+
+def check_cloud_only_backlog(paths: list[Path], max_cloud_only_gb: float, dry_run: bool) -> bool:
+    """
+    Pre-flight check: if a large amount of source content is still cloud-only
+    (e.g. OneDrive still downloading), a run right now would mostly just
+    populate the retry list rather than actually organize anything. Exits and
+    asks the user to try again once more has synced, unless --dry-run (warns
+    only, since a dry run never copies anything anyway).
+
+    Returns True if the backlog is small enough that cloud-only files
+    encountered during processing should be actively downloaded and folded
+    into this run (see hydrate_cloud_only_file()), rather than skipped for a
+    future --retry-file run. Always False under --dry-run — a dry run must
+    never touch the filesystem, and triggering a cloud download counts.
+    """
+    _, cloud_only_bytes = estimate_required_bytes(paths)
+    max_cloud_only_bytes = max_cloud_only_gb * 1024 ** 3
+    gb = 1024 ** 3
+
+    if cloud_only_bytes <= max_cloud_only_bytes:
+        if cloud_only_bytes and not dry_run:
+            print(f"{Fore.CYAN}{cloud_only_bytes / gb:.2f} GB is cloud-only but under the "
+                  f"{max_cloud_only_gb:.2f} GB threshold — will download these as they're "
+                  f"encountered instead of skipping them.")
+        return cloud_only_bytes > 0 and not dry_run
+
+    message = (f"{cloud_only_bytes / gb:.2f} GB of source files are still cloud-only "
+               f"(not downloaded yet) — more than the {max_cloud_only_gb:.2f} GB threshold.")
+    if dry_run:
+        print(f"{Fore.YELLOW}⚠  {message} Continuing since this is --dry-run.")
+        return False
+    else:
+        print(f"{Fore.RED}✗ {message}")
+        print(f"{Fore.RED}  Let OneDrive (or your cloud-sync provider) finish downloading more, "
+              f"then try again — or raise --max-cloud-only-gb if this is expected.")
+        sys.exit(1)
+
 # ── Processing pipeline ─────────────────────────────────────────────────────────
 
-def process_all_photos(paths: list[Path], workers: int) -> list[PhotoRecord]:
-    """Extract dates and hashes for every photo, in parallel."""
+def process_all_photos(paths: list[Path], workers: int, hydrate: bool = False) -> list[PhotoRecord]:
+    """Extract dates and hashes for every photo, in parallel. See process_photo()
+    for what `hydrate` does."""
     photos = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(process_photo, p): p for p in paths}
+        futures = {executor.submit(process_photo, p, hydrate): p for p in paths}
         for future in tqdm(as_completed(futures), total=len(futures), desc="  Processing", unit="photo"):
             photos.append(future.result())
     return photos
@@ -950,6 +1031,113 @@ def write_retry_file(results: OrganizeResults, output_root: Path, run_id: str) -
     retry_path.write_text("\n".join(paths) + "\n", encoding="utf-8")
     return retry_path
 
+
+ARCHIVE_EXTENSION = ".zip"
+
+
+def _verify_zip(zip_path: Path) -> Optional[str]:
+    """
+    Return None if `zip_path` is a valid, uncorrupted zip archive, or a
+    description of the problem otherwise. Uses zipfile's own CRC-checking
+    testzip() (reads every member and verifies its checksum) rather than
+    just confirming the file opens.
+    """
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            bad_name = zf.testzip()
+            return f"corrupt member: {bad_name}" if bad_name else None
+    except Exception as e:
+        return str(e)
+
+
+def archive_source(source: Path, chunk_gb: float, run_id: str) -> tuple[list[Path], list[tuple[str, str]]]:
+    """
+    Pack every file under `source` into a sequence of independent, fully
+    valid zip archives (~chunk_gb each, greedily filled — a single file
+    larger than chunk_gb still gets its own, larger chunk rather than being
+    split), written directly into `source`'s root as
+    archive_<run_id>_NNNN.zip. --source's existing files are never modified
+    or removed — this only adds new files alongside them.
+
+    Uses ZIP_STORED (no compression): photos/videos are already compressed
+    formats, so deflate would mostly just spend CPU without shrinking
+    output. Existing archive_*.zip files (e.g. from a previous run) are
+    skipped when walking, so re-running this doesn't zip its own output.
+
+    Each finished chunk is immediately verified with testzip() (see
+    _verify_zip()); any corrupt or unreadable chunk is reported back rather
+    than silently trusted.
+
+    Returns (zip_paths, problems) where problems is a list of
+    (file_or_archive_path, reason) for anything that couldn't be archived or
+    failed verification.
+    """
+    chunk_bytes = chunk_gb * 1024 ** 3
+    problems: list[tuple[str, str]] = []
+
+    all_files = []
+    for dirpath, dirnames, filenames in os.walk(source, followlinks=False):
+        dirnames[:] = [d for d in dirnames if not (Path(dirpath) / d).is_symlink()]
+        for name in filenames:
+            p = Path(dirpath) / name
+            if p.is_symlink() or p.suffix.lower() == ARCHIVE_EXTENSION:
+                continue
+            all_files.append(p)
+
+    if not all_files:
+        return [], problems
+
+    zip_paths: list[Path] = []
+    zf: Optional[zipfile.ZipFile] = None
+    current_size = 0
+    chunk_index = 0
+
+    def open_next_chunk():
+        nonlocal zf, current_size, chunk_index
+        close_current_chunk()
+        chunk_index += 1
+        chunk_path = source / f"archive_{run_id}_{chunk_index:04d}{ARCHIVE_EXTENSION}"
+        zf = zipfile.ZipFile(chunk_path, "w", compression=zipfile.ZIP_STORED)
+        zip_paths.append(chunk_path)
+        current_size = 0
+
+    def close_current_chunk():
+        nonlocal zf
+        if zf is None:
+            return
+        chunk_path = Path(zf.filename)
+        zf.close()
+        zf = None
+        bad = _verify_zip(chunk_path)
+        if bad:
+            problems.append((str(chunk_path), bad))
+
+    open_next_chunk()
+    for p in tqdm(all_files, desc="  Archiving", unit="file"):
+        try:
+            size = p.stat().st_size
+        except OSError as e:
+            problems.append((str(p), str(e)))
+            continue
+
+        if current_size > 0 and current_size + size > chunk_bytes:
+            open_next_chunk()
+
+        try:
+            arcname = str(p.relative_to(source))
+        except ValueError:
+            arcname = p.name
+
+        try:
+            zf.write(p, arcname=arcname)
+            current_size += size
+        except Exception as e:
+            problems.append((str(p), str(e)))
+
+    close_current_chunk()
+
+    return zip_paths, problems
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
@@ -965,6 +1153,17 @@ def parse_args() -> argparse.Namespace:
                         help="Reprocess only the photos listed in this file (one path per line) "
                              "instead of rescanning --source; see <output>/retry_photos.txt "
                              "from a previous run")
+    parser.add_argument("--max-cloud-only-gb", type=float, default=1.0,
+                        help="Abort before processing if more than this many GB of source files "
+                             "are still cloud-only / not downloaded yet (default: 1.0). Raise this "
+                             "if running against a partially-synced library is expected.")
+    parser.add_argument("--archive-source", action="store_true",
+                        help="After a fully successful run (zero errors, zero cloud-only), pack "
+                             "--source into ~--archive-chunk-gb zip files written to --source's "
+                             "own root (archive_<run_id>_NNNN.zip). --source's existing files are "
+                             "never modified; skipped under --dry-run or if the run wasn't clean.")
+    parser.add_argument("--archive-chunk-gb", type=float, default=1.0,
+                        help="Target size per zip chunk when using --archive-source (default: 1.0)")
     return parser.parse_args()
 
 
@@ -1052,10 +1251,11 @@ def main():
         sys.exit(0)
 
     check_disk_space(all_paths, output, args.dry_run)
+    hydrate = check_cloud_only_backlog(all_paths, args.max_cloud_only_gb, args.dry_run)
 
     # ── 2. Process (parallel) ─────────────────────────────────────────────────
     print(f"\n{Fore.CYAN}Extracting dates & computing hashes ({args.workers} workers)...")
-    photos = process_all_photos(all_paths, args.workers)
+    photos = process_all_photos(all_paths, args.workers, hydrate)
 
     # ── 3. Find duplicates ────────────────────────────────────────────────────
     dup_groups = find_duplicates(photos, args.hash_threshold)
@@ -1070,6 +1270,25 @@ def main():
     report_path = generate_report(results, output, args.dry_run, elapsed, retry_path)
 
     print_summary(results, report_path, log_path, retry_path, elapsed, args.dry_run)
+
+    # ── 6. Optional: archive source ───────────────────────────────────────────
+    if args.archive_source:
+        if args.dry_run:
+            print(f"{Fore.YELLOW}⚠  Skipping --archive-source: dry runs never create real output.")
+        elif results.errors or results.cloud_only:
+            print(f"{Fore.YELLOW}⚠  Skipping --archive-source: this run wasn't fully clean "
+                  f"({len(results.errors):,} errors, {len(results.cloud_only):,} cloud-only) — "
+                  f"resolve those and re-run first.")
+        else:
+            print(f"\n{Fore.CYAN}Archiving --source into ~{args.archive_chunk_gb:.2f} GB zip "
+                  f"chunks (written to {source})...")
+            zip_paths, problems = archive_source(source, args.archive_chunk_gb, run_id)
+            print(f"{Fore.GREEN}✓ Created {len(zip_paths):,} verified zip file(s) in {source}")
+            if problems:
+                print(f"{Fore.RED}✗ {len(problems):,} problem(s) during archiving (see log):")
+                for path_str, reason in problems:
+                    logger.error("Archive problem for %s: %s", path_str, reason)
+                    print(f"    {path_str}: {reason}")
 
 
 if __name__ == "__main__":

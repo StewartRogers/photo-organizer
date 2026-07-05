@@ -23,6 +23,8 @@ Scans tens of thousands of photos (and videos), removes near-duplicates, and org
 7. **Copies** organized photos and videos to `output/organized/YYYY/MM/`, together by date
 8. **Copies duplicates** to `output/duplicates/` for your review
 9. **Generates an HTML report** with all actions, suspicious dates, and duplicate groups
+10. **Optionally archives `--source`** into chunked, verified zip files after a
+    fully successful run (`--archive-source`) — see below
 
 > ✅ Your originals are **never moved or deleted**. Everything is copied.
 
@@ -81,6 +83,9 @@ python photo_organizer.py --source "C:\Photos\My Pictures" --output "C:\Photos\O
 | `--workers` | 4 | Parallel threads for hashing (increase to 8 on fast machines) |
 | `--log-file` | `<output>/photo_organizer.log` | Path to the log file (errors and library warnings) |
 | `--retry-file` | none | Reprocess only the photos listed in this file (one path per line) instead of rescanning `--source` — see `<output>/retry_photos.txt` from a previous run |
+| `--max-cloud-only-gb` | 1.0 | Abort before processing if more than this many GB of source files are still cloud-only / not downloaded yet |
+| `--archive-source` | off | After a fully successful run, zip `--source` into chunks (written to `--source`'s own root) |
+| `--archive-chunk-gb` | 1.0 | Target size per zip chunk when using `--archive-source` |
 
 ---
 
@@ -107,9 +112,12 @@ C:\Photos\Organized\
 ```
 
 Photos that are cloud-only placeholders (e.g. OneDrive Files On-Demand files not yet
-downloaded to this machine) are **left untouched in `--source`** — not copied to
-`errors/`, since there's nothing to read yet. They're listed separately in the
-report and in that run's `retry_photos_<timestamp>.txt`.
+downloaded to this machine) are handled one of two ways — see "Pre-Flight Disk
+Space Check" above. If the backlog is small, they're downloaded automatically
+and organized normally. Otherwise (or under `--dry-run`) they're **left
+untouched in `--source`** — not copied to `errors/`, since there's nothing to
+read yet — and listed separately in the report and in that run's
+`retry_photos_<timestamp>.txt`.
 
 Each run writes its own `retry_photos_<timestamp>.txt` (named after when that run
 started) rather than overwriting a single shared file — so a history of retry
@@ -134,6 +142,50 @@ If there isn't enough free space, the tool exits immediately with the
 shortfall in GB rather than discovering it hours into copying (this is
 exactly what happened before this check existed — see `CLAUDE.md`). Under
 `--dry-run` this only warns, since a dry run never copies anything anyway.
+
+The same pre-flight pass also checks how much of the source is still
+cloud-only:
+
+- **Over `--max-cloud-only-gb`** (default 1.0 GB): the tool exits and asks
+  you to let the sync catch up before trying again — running against a
+  library that's still mostly cloud-only would barely organize anything, and
+  only widens the window where duplicate detection can't see across separate
+  runs (see "Reprocessing" below). Raise the threshold if running against a
+  partially-synced library is expected. Under `--dry-run` this only warns.
+- **Under the threshold**: the backlog is small enough to just deal with
+  now — any cloud-only file encountered during processing is actively
+  downloaded (the same "read triggers hydration" mechanism OneDrive itself
+  uses) and folded into this run instead of being skipped for a future
+  `--retry-file` pass. This never happens under `--dry-run` (a dry run must
+  never touch the filesystem, and triggering a download counts).
+
+---
+
+## Archiving the Source (`--archive-source`)
+
+After a run with **zero errors and zero cloud-only leftovers**, `--archive-source`
+packs everything under `--source` into a sequence of independent zip files
+(~`--archive-chunk-gb` each, default 1.0 GB), written directly into
+**`--source`'s own root** — e.g. a 38 GB library becomes roughly 38
+`archive_<run_id>_NNNN.zip` files sitting alongside your original photos.
+
+- **Your originals are untouched** — archiving only adds new `.zip` files; it
+  never deletes or modifies anything already in `--source`, consistent with
+  this tool's copy-only guarantee everywhere else.
+- **No compression** (`ZIP_STORED`) — photos and videos are already
+  compressed formats, so deflate would mostly just spend CPU without
+  shrinking the output. This is chunking for easier transfer/upload, not
+  space-saving.
+- **A single file larger than the chunk size still gets its own (larger)
+  chunk** — individual files are never split across archives.
+- **Every chunk is verified immediately after being written**, using
+  `zipfile`'s own CRC check (`testzip()`) — not just "did it open," but "does
+  every entry's content actually match what was written." Any corrupt or
+  unreadable chunk is reported, not silently trusted.
+- Re-running `--archive-source` later won't re-zip its own previous output —
+  existing `archive_*.zip` files are skipped when scanning `--source`.
+- Skipped (with a message, not silently) under `--dry-run`, or if the run had
+  any errors or cloud-only files left over — resolve those and re-run first.
 
 ---
 
