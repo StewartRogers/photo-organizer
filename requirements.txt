@@ -1,7 +1,21 @@
-Pillow
-piexif
-imagehash
-tqdm
-colorama
-pillow-heif
-hachoir
+# Floor pins document the oldest version each dependency is known to work
+# with. They are deliberately not upper-bounded, so `pip install -U` still
+# picks up new releases.
+#
+# Python 3.9 note: the latest Pillow and pillow-heif require 3.10+, so on 3.9
+# pip back-resolves to the newest 3.9-compatible release (Pillow 11.3.0,
+# pillow-heif 1.1.1). That is expected and handled automatically -- the CI
+# matrix in .github/workflows/tests.yml runs the tests against both ends.
+
+Pillow>=11.0.0
+piexif>=1.1.3
+imagehash>=4.3.1
+tqdm>=4.66.0
+colorama>=0.4.6
+
+# Optional at runtime, but listed so a default install gets them:
+#   pillow-heif -> HEIC/HEIF support (without it HEIC files are scanned but skipped)
+#   hachoir     -> video creation-date metadata (without it videos fall back to
+#                  filename/filesystem dating)
+pillow-heif>=1.0.0
+hachoir>=3.3.0

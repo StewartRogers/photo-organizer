@@ -23,7 +23,14 @@ HTML report at the end.
   behavior.
 - `requirements.txt` / `requirements-dev.txt` — runtime deps (Pillow, piexif,
   imagehash, tqdm, colorama, pillow-heif, hachoir) and dev deps (adds pytest
-  and vermin), respectively. No other build/lint config — plain `python3
+  and vermin), respectively. Both use **floor pins** (`>=`) with no upper
+  bound: they record the oldest version known to work while still allowing
+  `pip install -U`. Floors are deliberately at or below the newest
+  3.9-compatible release of each package, because the latest Pillow,
+  pillow-heif and pytest all require 3.10+ — on 3.9 pip back-resolves
+  (Pillow 11.3.0, pillow-heif 1.1.1, pytest 8.4.2) and that is expected.
+  Verified resolving cleanly on 3.9/3.10/3.11/3.12. numpy/scipy/PyWavelets
+  are transitive via imagehash and intentionally unlisted. No other build/lint config — plain `python3
   photo_organizer.py ...`; tests via `pytest tests/` (`pip install -r
   requirements-dev.txt` first).
 - `.github/workflows/tests.yml` — CI. A `test` matrix job byte-compiles,
