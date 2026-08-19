@@ -940,7 +940,7 @@ def build_report_html(results: OrganizeResults, output_root: Path, dry_run: bool
 <p>Organized photos → <code>{output_root / "organized"}</code><br>
 Duplicates → <code>{output_root / "duplicates"}</code><br>
 Errored photos → <code>{output_root / "errors"}</code></p>
-{f"<p>Photos needing a retry (errors + cloud-only) → <code>{retry_path}</code> — use <code>--retry-file \"{retry_path}\"</code> on your next run.</p>" if retry_path else ""}
+{f'<p>Photos needing a retry (errors + cloud-only) → <code>{retry_path}</code> — use <code>--retry-file "{retry_path}"</code> on your next run.</p>' if retry_path else ''}
 """
 
     # Suspicious dates table
