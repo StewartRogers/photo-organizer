@@ -1,0 +1,59 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The supported range declared in photo_organizer.py
+        # (PYTHON_MIN_VERSION) and the README.
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+    name: py${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # Catches the failure mode that motivated this matrix: syntax that
+      # parses on a newer interpreter but not an older one (e.g. backslashes
+      # in f-string expressions, legal only from 3.12).
+      - name: Byte-compile
+        run: python -m compileall -q photo_organizer.py tests/
+
+      - name: Import check
+        run: python -c "import photo_organizer; print(photo_organizer.__name__, 'imports OK')"
+
+      - name: CLI smoke test
+        run: python photo_organizer.py --help
+
+      - name: Tests
+        run: pytest tests/ -q
+
+  version-floor:
+    runs-on: ubuntu-latest
+    name: vermin (min version)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install vermin
+      # Fails if anything raises the floor above 3.9 (the trailing "-" means
+      # "must run on 3.9 or older"). Static gate; the matrix job above is the
+      # runtime one -- vermin cannot see generics used outside annotations.
+      - run: vermin --target=3.9- --no-tips photo_organizer.py tests/

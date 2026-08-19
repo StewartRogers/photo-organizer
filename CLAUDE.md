@@ -22,10 +22,17 @@ HTML report at the end.
   `retry_photos_<run_id>.txt` round-trip, and video scanning/dating/no-dedup
   behavior.
 - `requirements.txt` / `requirements-dev.txt` — runtime deps (Pillow, piexif,
-  imagehash, tqdm, colorama, pillow-heif) and dev deps (adds pytest),
-  respectively. No other build/lint config — plain `python3 photo_organizer.py
-  ...`; tests via `pytest tests/` (`pip install -r requirements-dev.txt`
-  first).
+  imagehash, tqdm, colorama, pillow-heif, hachoir) and dev deps (adds pytest
+  and vermin), respectively. No other build/lint config — plain `python3
+  photo_organizer.py ...`; tests via `pytest tests/` (`pip install -r
+  requirements-dev.txt` first).
+- `.github/workflows/tests.yml` — CI. A `test` matrix job byte-compiles,
+  imports, smoke-tests `--help`, and runs pytest on Python 3.9/3.10/3.11/3.12;
+  a separate `version-floor` job runs `vermin --target=3.9-` as a static gate.
+  The two are complementary: vermin catches version-only *syntax* without
+  needing old interpreters installed, but is blind to generics used outside
+  annotations (e.g. `isinstance(v, int | str)`) — the matrix job catches those
+  by actually importing on 3.9.
 
 ## Key functions
 
@@ -307,6 +314,28 @@ prior clean run, since there's no `results` object in this code path at all
   advisory rather than gating anything. This step doesn't parallelize with
   `--workers`. Re-benchmark before assuming a specific runtime at very large
   scale or unusually high thresholds.
+
+## Python version support
+
+Supported range is **3.9 - 3.12**, declared in three places that must stay in
+sync: `PYTHON_MIN_VERSION` in `photo_organizer.py`, the CI matrix in
+`.github/workflows/tests.yml`, and the README's Requirements section.
+
+`photo_organizer.py` starts with `from __future__ import annotations` (PEP
+563), which keeps every annotation an unevaluated string. That is what makes
+newer typing syntax (`str | None`, PEP 604, normally 3.10+) safe to write here
+without breaking 3.9 — **do not remove that import**, and do not rely on
+annotations being real objects at runtime (nothing calls `get_type_hints()`
+today).
+
+### Why this exists
+
+Commit `c1b2612` shipped `--retry-file \"{retry_path}\"` inside an f-string
+expression. Backslashes in f-string expressions are legal only from 3.12
+(PEP 701), so the module could not even be imported on 3.11 — the CLI would
+not start and the test suite could not be collected. It reached `main` because
+the repo had no CI. The matrix job exists specifically to stop a repeat when
+the project is edited from machines on different Python versions.
 
 ## Conventions to preserve
 

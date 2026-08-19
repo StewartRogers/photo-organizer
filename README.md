@@ -33,8 +33,12 @@ Scans tens of thousands of photos (and videos), removes near-duplicates, and org
 ## Requirements
 
 ### Python
-You need Python 3.10 or newer.  
+Python **3.9, 3.10, 3.11, or 3.12** — any of these work; the tool is tested
+against all four on every push (see `.github/workflows/tests.yml`).
 Download from: https://www.python.org/downloads/
+
+Running on an older interpreter exits immediately with a clear message rather
+than failing partway through a run.
 
 ### Install Dependencies
 
@@ -268,6 +272,17 @@ and either wait for background sync to finish or right-click the folder →
 pip install -r requirements-dev.txt
 pytest tests/
 ```
+
+To check the code still runs on the oldest supported Python (3.9) without
+having 3.9 installed:
+
+```
+vermin --target=3.9- --no-tips photo_organizer.py tests/
+```
+
+This is a static check — it catches syntax that is only legal on a newer
+interpreter (the most likely way support silently breaks when the project is
+edited from machines running different Python versions).
 
 ---
 

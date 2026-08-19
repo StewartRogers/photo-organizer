@@ -31,7 +31,14 @@ Optional flags:
     --archive-source   After a fully successful run, zip --source in chunks
                        (written to --source's own root; see --archive-chunk-gb)
     --archive-only     Skip scanning/organizing and just archive --source now
+
+Supported Python versions: 3.9 - 3.12 (see PYTHON_MIN_VERSION below).
 """
+
+# Keeps annotations unevaluated (PEP 563), so newer typing syntax such as
+# `str | None` (PEP 604, 3.10+) stays parseable on 3.9. Without this, an
+# annotation written on a newer interpreter breaks import on an older one.
+from __future__ import annotations
 
 import os
 import sys
@@ -49,6 +56,17 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 import time
+
+# Lowest interpreter this tool is tested against. Checked at import time so an
+# unsupported interpreter produces this message rather than an obscure
+# AttributeError/TypeError from a newer stdlib API deeper into the run.
+PYTHON_MIN_VERSION = (3, 9)
+if sys.version_info < PYTHON_MIN_VERSION:
+    sys.exit(
+        "photo_organizer requires Python "
+        f"{PYTHON_MIN_VERSION[0]}.{PYTHON_MIN_VERSION[1]} or newer; "
+        f"this is {sys.version_info[0]}.{sys.version_info[1]}."
+    )
 
 # Console output uses non-ASCII characters (⚠, ✓, ❌, emoji, ...). On a
 # non-UTF-8 console (e.g. legacy Windows cp1252) this would otherwise raise
