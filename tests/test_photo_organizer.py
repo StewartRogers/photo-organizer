@@ -9,6 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import photo_organizer as po
 
 import imagehash
+import piexif
+import pytest
 from PIL import Image
 
 
@@ -333,6 +335,70 @@ def test_compute_perceptual_hash_no_warning_on_palette_transparency(tmp_path):
 
     assert result is not None
     assert not any("Palette images with Transparency" in str(w.message) for w in caught)
+
+
+# ── PILLOW_OPEN_FORMATS decoder allowlist ───────────────────────────────────
+
+# Minimal EPS header: enough for Pillow's content sniffing to pick EpsImagePlugin.
+EPS_BYTES = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 8 8\n%%EndComments\n"
+
+
+def test_eps_disguised_as_jpg_never_reaches_ghostscript(tmp_path, monkeypatch):
+    from PIL import EpsImagePlugin
+
+    path = tmp_path / "IMG_20200101_120000.jpg"
+    path.write_bytes(EPS_BYTES)
+    # Sanity: without the allowlist, Pillow really would hand this to the EPS plugin.
+    with Image.open(path) as img:
+        assert img.format == "EPS"
+
+    def fail(*args, **kwargs):
+        raise AssertionError("Ghostscript was invoked")
+
+    monkeypatch.setattr(EpsImagePlugin, "Ghostscript", fail)
+
+    assert po.compute_perceptual_hash(path) is None
+    # Still dated (from the filename) rather than treated as an error.
+    dt, source = po.get_photo_date(path)
+    assert source == "filename"
+    assert dt == datetime(2020, 1, 1, 12, 0, 0)
+
+
+@pytest.mark.parametrize("fmt, name", [
+    ("JPEG", "a.jpg"),
+    ("PNG", "a.png"),
+    ("GIF", "a.gif"),
+    ("BMP", "a.bmp"),
+    ("TIFF", "a.tif"),
+    ("WEBP", "a.webp"),
+    ("TIFF", "a.dng"),  # TIFF-container RAW formats open via the TIFF entry
+    pytest.param("HEIF", "a.heic", marks=pytest.mark.skipif(
+        not po.HEIC_SUPPORTED, reason="pillow-heif not installed")),
+])
+def test_allowlisted_formats_still_hash(tmp_path, fmt, name):
+    path = tmp_path / name
+    Image.new("RGB", (32, 32), (200, 30, 30)).save(path, format=fmt)
+    assert po.compute_perceptual_hash(path) is not None
+
+
+def test_mpo_named_jpg_still_hashes(tmp_path):
+    # Multi-picture JPEGs (some phones/3D cameras) are detected as MPO by the
+    # JPEG entry, so the allowlist doesn't need a separate "MPO" name.
+    path = tmp_path / "multi.jpg"
+    frames = [Image.new("RGB", (32, 32), c) for c in ((255, 0, 0), (0, 0, 255))]
+    frames[0].save(path, format="MPO", save_all=True, append_images=frames[1:])
+    with Image.open(path) as img:
+        assert img.format == "MPO"
+    assert po.compute_perceptual_hash(path) is not None
+
+
+def test_exif_date_still_read_through_allowlist(tmp_path):
+    exif_bytes = piexif.dump(
+        {"Exif": {piexif.ExifIFD.DateTimeOriginal: b"2019:06:15 08:30:00"}}
+    )
+    path = tmp_path / "photo.jpg"
+    Image.new("RGB", (16, 16)).save(path, format="JPEG", exif=exif_bytes)
+    assert po.get_photo_date(path) == (datetime(2019, 6, 15, 8, 30, 0), "EXIF:DateTimeOriginal")
 
 
 # ── build_report_html error overflow ────────────────────────────────────────

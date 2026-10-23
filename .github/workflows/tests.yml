@@ -14,7 +14,7 @@ jobs:
       matrix:
         # The supported range declared in photo_organizer.py
         # (PYTHON_MIN_VERSION) and the README.
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12"]
 
     name: py${{ matrix.python-version }}
     steps:
@@ -53,7 +53,22 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install vermin
-      # Fails if anything raises the floor above 3.9 (the trailing "-" means
-      # "must run on 3.9 or older"). Static gate; the matrix job above is the
+      # Fails if anything raises the floor above 3.11 (the trailing "-" means
+      # "must run on 3.11 or older"). Static gate; the matrix job above is the
       # runtime one -- vermin cannot see generics used outside annotations.
-      - run: vermin --target=3.9- --no-tips photo_organizer.py tests/
+      - run: vermin --target=3.11- --no-tips photo_organizer.py tests/
+
+  audit:
+    runs-on: ubuntu-latest
+    name: pip-audit
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit
+      # Resolves requirements.txt in an isolated environment and fails on any
+      # dependency with a published advisory, so new advisories (like the
+      # Pillow batch fixed in 13.0.0) fail CI instead of waiting on a manual
+      # check. Can go red with no code change when a new advisory lands.
+      - run: pip-audit -r requirements.txt --strict

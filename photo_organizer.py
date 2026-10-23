@@ -32,12 +32,13 @@ Optional flags:
                        (written to --source's own root; see --archive-chunk-gb)
     --archive-only     Skip scanning/organizing and just archive --source now
 
-Supported Python versions: 3.9 - 3.12 (see PYTHON_MIN_VERSION below).
+Supported Python versions: 3.11 - 3.12 (see PYTHON_MIN_VERSION below).
 """
 
-# Keeps annotations unevaluated (PEP 563), so newer typing syntax such as
-# `str | None` (PEP 604, 3.10+) stays parseable on 3.9. Without this, an
-# annotation written on a newer interpreter breaks import on an older one.
+# Keeps annotations unevaluated (PEP 563). No longer strictly required since
+# the floor moved to 3.11 (PEP 604 `str | None` is native there), but kept so
+# typing syntax newer than the floor still can't break import on an older
+# supported interpreter.
 from __future__ import annotations
 
 import os
@@ -60,7 +61,7 @@ import time
 # Lowest interpreter this tool is tested against. Checked at import time so an
 # unsupported interpreter produces this message rather than an obscure
 # AttributeError/TypeError from a newer stdlib API deeper into the run.
-PYTHON_MIN_VERSION = (3, 9)
+PYTHON_MIN_VERSION = (3, 11)
 if sys.version_info < PYTHON_MIN_VERSION:
     sys.exit(
         "photo_organizer requires Python "
@@ -115,6 +116,16 @@ SUPPORTED_PHOTO_EXTENSIONS = {
     '.webp', '.heic', '.heif', '.cr2', '.cr3', '.nef', '.arw',
     '.orf', '.rw2', '.dng', '.raf', '.pef', '.srw', '.raw'
 }
+
+# The only Pillow decoders Image.open() may use. Pillow picks a decoder by
+# sniffing file contents, not the extension, so without this a file named
+# .jpg that is really EPS, PDF, SPIDER, etc. would reach a decoder this tool
+# never needs (EPS shells out to Ghostscript). The RAW extensions above that
+# Pillow can read at all (.cr2, .nef, .dng, ...) are TIFF containers, and MPO
+# (multi-picture JPEG) is opened through the JPEG entry.
+PILLOW_OPEN_FORMATS = (
+    "JPEG", "PNG", "GIF", "BMP", "TIFF", "WEBP",
+) + (("HEIF",) if HEIC_SUPPORTED else ())
 
 # Videos are organized by date alongside photos (so a trip's photos and clips
 # land in the same YYYY/MM folder), but never deduplicated — no MD5/perceptual
@@ -263,7 +274,7 @@ def get_photo_date(path: Path) -> tuple[Optional[datetime], str]:
 
     # ── EXIF ──────────────────────────────────────────
     try:
-        with Image.open(path) as img:
+        with Image.open(path, formats=PILLOW_OPEN_FORMATS) as img:
             exif_bytes = img.info.get("exif")
             if exif_bytes:
                 try:
@@ -384,7 +395,7 @@ def compute_file_hash(path: Path) -> str:
 def compute_perceptual_hash(path: Path) -> Optional[imagehash.ImageHash]:
     """Perceptual hash for visual similarity."""
     try:
-        with Image.open(path) as img:
+        with Image.open(path, formats=PILLOW_OPEN_FORMATS) as img:
             if img.mode == "P" and "transparency" in img.info:
                 img = img.convert("RGBA")
             img = img.convert("RGB")

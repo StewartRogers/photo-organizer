@@ -22,24 +22,25 @@ HTML report at the end.
   `retry_photos_<run_id>.txt` round-trip, and video scanning/dating/no-dedup
   behavior.
 - `requirements.txt` / `requirements-dev.txt` — runtime deps (Pillow, piexif,
-  imagehash, tqdm, colorama, pillow-heif, hachoir) and dev deps (adds pytest
-  and vermin), respectively. Both use **floor pins** (`>=`) with no upper
-  bound: they record the oldest version known to work while still allowing
-  `pip install -U`. Floors are deliberately at or below the newest
-  3.9-compatible release of each package, because the latest Pillow,
-  pillow-heif and pytest all require 3.10+ — on 3.9 pip back-resolves
-  (Pillow 11.3.0, pillow-heif 1.1.1, pytest 8.4.2) and that is expected.
-  Verified resolving cleanly on 3.9/3.10/3.11/3.12. numpy/scipy/PyWavelets
-  are transitive via imagehash and intentionally unlisted. No other build/lint config — plain `python3
+  imagehash, tqdm, colorama, pillow-heif, hachoir) and dev deps (adds pytest,
+  vermin and pip-audit), respectively. Both use **floor pins** (`>=`) with no
+  upper bound: they record the oldest version known to work while still
+  allowing `pip install -U`. Exception: `Pillow>=13.0.0` is a *security*
+  floor (see the 2026-10-23 section below) — don't lower it for
+  compatibility. numpy/scipy/PyWavelets are transitive via imagehash and
+  intentionally unlisted. No other build/lint config — plain `python3
   photo_organizer.py ...`; tests via `pytest tests/` (`pip install -r
   requirements-dev.txt` first).
 - `.github/workflows/tests.yml` — CI. A `test` matrix job byte-compiles,
-  imports, smoke-tests `--help`, and runs pytest on Python 3.9/3.10/3.11/3.12;
-  a separate `version-floor` job runs `vermin --target=3.9-` as a static gate.
+  imports, smoke-tests `--help`, and runs pytest on Python 3.11/3.12;
+  a separate `version-floor` job runs `vermin --target=3.11-` as a static gate.
   The two are complementary: vermin catches version-only *syntax* without
   needing old interpreters installed, but is blind to generics used outside
   annotations (e.g. `isinstance(v, int | str)`) — the matrix job catches those
-  by actually importing on 3.9.
+  by actually importing on 3.11. A third `audit` job runs `pip-audit -r
+  requirements.txt` and fails on any dependency with a published advisory —
+  it can go red with no code change when a new advisory lands; that's
+  intended.
 
 ## Key functions
 
@@ -324,14 +325,16 @@ prior clean run, since there's no `results` object in this code path at all
 
 ## Python version support
 
-Supported range is **3.9 - 3.12**, declared in three places that must stay in
-sync: `PYTHON_MIN_VERSION` in `photo_organizer.py`, the CI matrix in
-`.github/workflows/tests.yml`, and the README's Requirements section.
+Supported range is **3.11 - 3.12**, declared in three places that must stay
+in sync: `PYTHON_MIN_VERSION` in `photo_organizer.py`, the CI matrix in
+`.github/workflows/tests.yml`, and the README's Requirements section (plus the
+vermin `--target` in CI and the README). It was 3.9 - 3.12 until 2026-10-23;
+raised because the patched Pillow (13.0.0) requires 3.11+ — see below.
 
 `photo_organizer.py` starts with `from __future__ import annotations` (PEP
 563), which keeps every annotation an unevaluated string. That is what makes
-newer typing syntax (`str | None`, PEP 604, normally 3.10+) safe to write here
-without breaking 3.9 — **do not remove that import**, and do not rely on
+typing syntax newer than the floor safe to write here without breaking the
+oldest supported interpreter — **do not remove that import**, and do not rely on
 annotations being real objects at runtime (nothing calls `get_type_hints()`
 today).
 
@@ -343,6 +346,36 @@ expression. Backslashes in f-string expressions are legal only from 3.12
 not start and the test suite could not be collected. It reached `main` because
 the repo had no CI. The matrix job exists specifically to stop a repeat when
 the project is edited from machines on different Python versions.
+
+## Fixed in the 2026-10-23 patch check (Pillow advisories)
+
+`pip-audit` flagged Pillow 12.3.0 with 35 advisories (3 critical, 22 high, 10
+moderate; GHSAs published 2026-10-20..22), all fixed only in Pillow 13.0.0,
+which requires Python 3.11+. No patched Pillow exists for 3.9 (resolves to
+11.3.0) or 3.10 (12.3.0), so by user decision the supported range dropped to
+3.11 - 3.12 rather than keep knowingly-vulnerable installs.
+
+- `requirements.txt`: `Pillow>=13.0.0` (security floor).
+- Added `PILLOW_OPEN_FORMATS` and passed it as `formats=` to both
+  `Image.open()` calls (`get_photo_date()`, `compute_perceptual_hash()`).
+  Pillow sniffs content, not extension, so a file named `.jpg` that is really
+  EPS used to reach `EpsImagePlugin` → Ghostscript (`/usr/bin/gs` is
+  installed on the dev machine; CVE-2026-112900 is a Ghostscript argument
+  injection). The allowlist keeps every decoder this tool can legitimately
+  need — RAW files Pillow can read are TIFF containers, and MPO opens via the
+  JPEG entry — and cuts off EPS, PDF, SPIDER, MIC, XBM, MSP, WMF, JPEG 2000,
+  etc. regardless of what Pillow version is installed. A file whose content
+  doesn't match is *not* an error: both call sites already swallow open
+  failures, so it is still dated (filename → filesystem), MD5-deduped and
+  organized — it just gets no EXIF date and no perceptual hash, exactly like
+  a `.cr3` Pillow can't read today. `"HEIF"` is
+  only included when `HEIC_SUPPORTED`, because `Image.open()` raises
+  `KeyError` for an unregistered format name.
+- Added the `audit` CI job and `pip-audit` to `requirements-dev.txt`.
+- Known leftover: Pillow 13.0.0 wheels still bundle `libbrotlidec` 1.2.0
+  (in the CVE-2026-111497 range; Brotli 1.2.1 shipped after Pillow 13.0.0).
+  Pillow only uses it through FreeType for WOFF2 fonts, which this tool never
+  loads — not reachable here, but external scanners may flag it.
 
 ## Conventions to preserve
 

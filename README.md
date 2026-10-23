@@ -33,8 +33,11 @@ Scans tens of thousands of photos (and videos), removes near-duplicates, and org
 ## Requirements
 
 ### Python
-Python **3.9, 3.10, 3.11, or 3.12** — any of these work; the tool is tested
-against all four on every push (see `.github/workflows/tests.yml`).
+Python **3.11 or 3.12** — either works; the tool is tested against both on
+every push (see `.github/workflows/tests.yml`). 3.9 and 3.10 are no longer
+supported: the Pillow release that fixes the October 2026 image-decoder
+security advisories (13.0.0) requires Python 3.11+, and there is no patched
+Pillow for older interpreters.
 Download from: https://www.python.org/downloads/
 
 Running on an older interpreter exits immediately with a clear message rather
@@ -273,16 +276,22 @@ pip install -r requirements-dev.txt
 pytest tests/
 ```
 
-To check the code still runs on the oldest supported Python (3.9) without
-having 3.9 installed:
+To check the code still runs on the oldest supported Python (3.11) without
+having 3.11 installed:
 
 ```
-vermin --target=3.9- --no-tips photo_organizer.py tests/
+vermin --target=3.11- --no-tips photo_organizer.py tests/
 ```
 
 This is a static check — it catches syntax that is only legal on a newer
 interpreter (the most likely way support silently breaks when the project is
 edited from machines running different Python versions).
+
+To check the dependencies for known security advisories (CI runs this too):
+
+```
+pip-audit -r requirements.txt
+```
 
 ---
 
