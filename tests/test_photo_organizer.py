@@ -1,7 +1,7 @@
 import logging
 import sys
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -79,8 +79,10 @@ def test_is_date_suspicious_out_of_range():
 
 # ── find_duplicates ──────────────────────────────────────────────────────────
 
-def make_record(path, file_hash=None, phash=None, date=None, size=100):
-    return po.PhotoRecord(path=path, file_hash=file_hash, phash=phash, date=date, size=size)
+def make_record(path, file_hash=None, phash=None, date=None, size=100,
+                pixels=0, date_source="error"):
+    return po.PhotoRecord(path=path, file_hash=file_hash, phash=phash, date=date, size=size,
+                          pixels=pixels, date_source=date_source)
 
 
 def test_find_duplicates_exact_hash_keeps_oldest():
@@ -152,6 +154,55 @@ def test_find_duplicates_visual_clustering_is_greedy_not_transitive():
     dup_groups = po.find_duplicates([a, b, c], hash_threshold=4)
 
     assert dup_groups == {"/x/a.jpg": ["/x/b.jpg"]}
+
+
+# ── find_duplicates keeper choice (quality first) ────────────────────────────
+
+_HASH_A = str(imagehash.hex_to_hash("0" * 16))
+_HASH_A_NEAR = str(imagehash.hex_to_hash("0" * 15 + "3"))  # distance 2 from _HASH_A
+
+
+def test_find_duplicates_keeps_higher_resolution_over_older_filename_date():
+    # The motivating case: a downscaled copy with EXIF stripped is dated from
+    # its filename (midnight), which is "older" than the original's EXIF
+    # timestamp from the same afternoon. The full-resolution original must win.
+    original = make_record("/x/IMG_1234.jpg", file_hash="h1", phash=_HASH_A,
+                           date=datetime(2015, 6, 1, 14, 30), size=4_000_000,
+                           pixels=4000 * 3000, date_source="EXIF:DateTimeOriginal")
+    small = make_record("/x/2015-06-01_small.jpg", file_hash="h2", phash=_HASH_A_NEAR,
+                        date=datetime(2015, 6, 1), size=200_000,
+                        pixels=800 * 600, date_source="filename")
+
+    dup_groups = po.find_duplicates([small, original], hash_threshold=4)
+
+    assert dup_groups == {"/x/IMG_1234.jpg": ["/x/2015-06-01_small.jpg"]}
+
+
+def test_find_duplicates_prefers_real_exif_at_same_resolution():
+    with_exif = make_record("/x/a.jpg", file_hash="h1", phash=_HASH_A,
+                            date=datetime(2020, 1, 2), size=100, pixels=1000,
+                            date_source="EXIF:DateTimeOriginal")
+    stripped = make_record("/x/b.jpg", file_hash="h2", phash=_HASH_A_NEAR,
+                           date=datetime(2020, 1, 1), size=500, pixels=1000,
+                           date_source="filesystem")
+
+    dup_groups = po.find_duplicates([stripped, with_exif], hash_threshold=4)
+
+    assert dup_groups == {"/x/a.jpg": ["/x/b.jpg"]}
+
+
+def test_find_duplicates_ignores_suspicious_exif_when_choosing_keeper():
+    suspicious = make_record("/x/a.jpg", file_hash="h1", phash=_HASH_A,
+                             date=datetime(1980, 1, 1), size=100, pixels=1000,
+                             date_source="EXIF:DateTimeOriginal (SUSPICIOUS — year 1980)")
+    bigger = make_record("/x/b.jpg", file_hash="h2", phash=_HASH_A_NEAR,
+                         date=datetime(2020, 1, 1), size=500, pixels=1000,
+                         date_source="filesystem")
+
+    dup_groups = po.find_duplicates([suspicious, bigger], hash_threshold=4)
+
+    # Neither has a usable EXIF date, so the larger file wins.
+    assert dup_groups == {"/x/b.jpg": ["/x/a.jpg"]}
 
 
 # ── safe_copy ────────────────────────────────────────────────────────────────
@@ -793,7 +844,7 @@ def _fake_metadata(creation_date):
 
 def test_get_video_date_prefers_container_metadata(tmp_path, monkeypatch):
     # Filename has no date at all, so metadata is the only possible source.
-    video = tmp_path / "clip.mp4"
+    video = tmp_path / "clip.avi"  # not a UTC container, so no conversion
     video.write_bytes(b"fake video bytes")
 
     monkeypatch.setattr(po, "VIDEO_METADATA_SUPPORTED", True)
@@ -805,6 +856,43 @@ def test_get_video_date_prefers_container_metadata(tmp_path, monkeypatch):
 
     assert dt == datetime(2022, 4, 7, 17, 48, 1)
     assert source == "video metadata"
+
+
+@pytest.mark.parametrize("name", ["clip.mp4", "clip.MOV", "clip.mkv", "clip.wmv"])
+def test_get_video_date_converts_utc_container_metadata_to_local(tmp_path, monkeypatch, name):
+    video = tmp_path / name
+    video.write_bytes(b"fake video bytes")
+
+    monkeypatch.setattr(po, "VIDEO_METADATA_SUPPORTED", True)
+    monkeypatch.setattr(po, "createParser", lambda path: _FakeVideoParser())
+    # 01:00 UTC on Feb 1 is 20:00 on Jan 31 in UTC-5 — a different month folder.
+    monkeypatch.setattr(po, "extractMetadata",
+                         lambda parser: _fake_metadata(datetime(2026, 2, 1, 1, 0, 0)))
+    real_utc_to_local = po.utc_to_local
+    monkeypatch.setattr(po, "utc_to_local",
+                         lambda dt: real_utc_to_local(dt, timezone(timedelta(hours=-5))))
+
+    dt, source = po.get_video_date(video)
+
+    assert dt == datetime(2026, 1, 31, 20, 0, 0)
+    assert source == "video metadata"
+
+
+def test_utc_to_local_converts_with_explicit_timezone():
+    est = timezone(timedelta(hours=-5))
+    assert po.utc_to_local(datetime(2026, 2, 1, 1, 0), est) == datetime(2026, 1, 31, 20, 0)
+
+
+def test_utc_to_local_returns_input_when_platform_cannot_convert():
+    class _Unconvertible(tzinfo):
+        def utcoffset(self, dt):
+            return None
+
+        def fromutc(self, dt):
+            raise OverflowError("timestamp out of range for platform")
+
+    dt = datetime(1904, 1, 1)
+    assert po.utc_to_local(dt, _Unconvertible()) == dt
 
 
 def test_get_video_date_falls_back_to_filename_when_metadata_unavailable(tmp_path, monkeypatch):
@@ -870,6 +958,92 @@ def test_organize_photos_organizes_video_like_a_photo(tmp_path):
     assert results.organized == 1
     assert results.duplicates == 0
     assert (output / "organized" / "2019" / "07" / "VID_20190704_120000.mp4").exists()
+
+
+# ── RAW files ────────────────────────────────────────────────────────────────
+
+def test_is_original_detects_raw_and_tiff_extensions():
+    assert po.is_original(Path("DSC_0001.NEF")) is True
+    assert po.is_original(Path("IMG_0001.cr2")) is True
+    assert po.is_original(Path("IMG_0001.dng")) is True
+    assert po.is_original(Path("DSC_0001.tif")) is True
+    assert po.is_original(Path("DSC_0001.TIFF")) is True
+    assert po.is_original(Path("IMG_0001.jpg")) is False
+
+
+def test_raw_jpeg_and_tiff_of_same_shot_are_all_kept(tmp_path):
+    # A trip shot as NEF + JPEG with a TIF export of the same frame: the same
+    # image three ways. None may end up in duplicates/ — the JPEG is the only
+    # one hashed, so it has nothing to match against.
+    pixels = Image.new("RGB", (64, 48), (120, 80, 200))
+    exif = piexif.dump({"Exif": {piexif.ExifIFD.DateTimeOriginal: b"2026:10:23 14:30:00"}})
+    for name, fmt in [("DSC_0001.jpg", "JPEG"), ("DSC_0001.tif", "TIFF"),
+                      ("DSC_0001.nef", "TIFF")]:
+        pixels.save(tmp_path / name, format=fmt, exif=exif)
+
+    records = [po.process_photo(tmp_path / n)
+               for n in ("DSC_0001.jpg", "DSC_0001.tif", "DSC_0001.nef")]
+    dup_groups = po.find_duplicates(records, hash_threshold=4)
+    output = tmp_path / "out"
+    results = po.organize_photos(records, dup_groups, output, dry_run=False)
+
+    month = output / "organized" / "2026" / "10"
+    assert dup_groups == {}
+    assert results.organized == 3 and results.duplicates == 0
+    assert (month / "DSC_0001.jpg").exists()
+    assert (month / "originals" / "DSC_0001.tif").exists()
+    assert (month / "originals" / "DSC_0001.nef").exists()
+
+
+def test_process_photo_never_hashes_raw_but_still_gets_a_date(tmp_path):
+    raw = tmp_path / "DSC_20190704_120000.nef"
+    raw.write_bytes(b"fake raw data")
+
+    record = po.process_photo(raw)
+
+    assert record.error is None
+    assert record.file_hash is None
+    assert record.phash is None
+    assert record.date == datetime(2019, 7, 4, 12, 0, 0)
+
+
+def test_raw_exif_date_read_from_tiff_tags(tmp_path):
+    # NEF/CR2/DNG/ARW are TIFF containers: Pillow exposes their EXIF via
+    # getexif(), not img.info["exif"], so this exercises that fallback path.
+    raw = tmp_path / "DSC_0001.nef"
+    exif = piexif.dump({"0th": {piexif.ImageIFD.DateTime: b"2020:05:18 09:00:00"},
+                        "Exif": {piexif.ExifIFD.DateTimeOriginal: b"2020:05:17 14:30:00"}})
+    Image.new("RGB", (8, 8)).save(raw, format="TIFF", exif=exif)
+
+    dt, source = po.get_photo_date(raw)
+
+    assert dt == datetime(2020, 5, 17, 14, 30, 0)
+    assert source == "EXIF:DateTimeOriginal"
+
+
+def test_organize_photos_puts_raw_in_originals_subfolder(tmp_path):
+    jpg_src = tmp_path / "DSC_0001.jpg"
+    raw_src = tmp_path / "DSC_0001.NEF"
+    jpg_src.write_bytes(b"fake jpeg")
+    raw_src.write_bytes(b"fake raw")
+    records = [make_record(str(jpg_src), file_hash="j", date=datetime(2026, 10, 23)),
+               make_record(str(raw_src), date=datetime(2026, 10, 23))]
+
+    output = tmp_path / "out"
+    results = po.organize_photos(records, {}, output, dry_run=False)
+
+    month = output / "organized" / "2026" / "10"
+    assert results.organized == 2
+    assert (month / "DSC_0001.jpg").exists()
+    assert (month / "originals" / "DSC_0001.NEF").exists()
+
+
+def test_destination_path_raw_without_date_goes_to_unknown_date_originals(tmp_path):
+    record = make_record("/src/DSC_0001.nef", date=None)
+
+    dest = po.destination_path(record, tmp_path)
+
+    assert dest == tmp_path / "organized" / "unknown_date" / "originals" / "DSC_0001.nef"
 
 
 # ── archive_source / _verify_zip ─────────────────────────────────────────────

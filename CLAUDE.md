@@ -12,11 +12,12 @@ HTML report at the end.
 
 - `photo_organizer.py` — the tool (~1,350 lines). Photos/videos are passed around
   as a `PhotoRecord` dataclass (`path`, `size`, `date`, `date_source`,
-  `file_hash`, `phash`, `error`, `cloud_only`); pipeline results use an
+  `file_hash`, `phash`, `pixels`, `error`, `cloud_only`); pipeline results use an
   `OrganizeResults` dataclass.
-- `tests/test_photo_organizer.py` — pytest suite (85 tests) covering date
+- `tests/test_photo_organizer.py` — pytest suite (100 tests) covering date
   parsing, `find_duplicates` grouping (including the BK-tree-backed visual
-  clustering), `safe_copy` collision/overwrite handling, symlink skipping in
+  clustering and quality-first keeper choice), RAW/TIFF handling (no hashing,
+  `originals/` placement, EXIF via TIFF tags), UTC→local video dates, `safe_copy` collision/overwrite handling, symlink skipping in
   `scan_photos`, `validate_paths`, `resolve_log_path`/`setup_logging`, the
   `PILLOW_OPEN_FORMATS` allowlist (EPS-disguised-as-JPG rejection, every
   allowlisted format still hashing), the report's error-overflow note, the
@@ -37,6 +38,11 @@ HTML report at the end.
   intentionally unlisted. No other build/lint config — plain `python3
   photo_organizer.py ...`; tests via `pytest tests/` (`pip install -r
   requirements-dev.txt` first).
+- `.venv/` — project-local virtual environment (gitignored; set up
+  2026-10-24 on the Windows dev machine with `py -3.15 -m venv .venv`, dev
+  requirements installed). Run things through `.venv\Scripts\python.exe`
+  (e.g. `.venv\Scripts\python.exe -m pytest tests`). The system Python
+  there has none of the dependencies, not even pytest.
 - `.github/workflows/tests.yml` — CI. A `test` matrix job byte-compiles,
   imports, smoke-tests `--help`, and runs pytest on Python 3.12/3.13/3.14/3.15;
   a separate `version-floor` job runs `vermin --target=3.12-` as a static gate.
@@ -72,7 +78,8 @@ HTML report at the end.
   Matches both `SUPPORTED_PHOTO_EXTENSIONS` and `SUPPORTED_VIDEO_EXTENSIONS`.
 - `find_duplicates()` — exact match via MD5, then perceptual-hash clustering
   (`--hash-threshold`, default 4) for photos not already exact-matched, using a
-  `BKTree` (see below) instead of all-pairs comparison. Prints a warning above
+  `BKTree` (see below) instead of all-pairs comparison. Keeper choice is
+  quality-first (see the 2026-10-24 section). Prints a warning above
   `VISUAL_DEDUP_WARN_THRESHOLD` (50k) photos but still proceeds. Videos never
   appear here (see `is_video()` above).
 - `BKTree`/`_BKNode` — a BK-tree (metric tree keyed on Hamming distance) that
@@ -311,11 +318,54 @@ for the log file) but nothing is written there in this mode. Same
 prior clean run, since there's no `results` object in this code path at all
 — archiving-only is the user's explicit call, taken at face value.
 
+## Changed in the 2026-10-24 quality pass
+
+User's stated priority: output quality over speed. Three changes:
+
+- **Keeper choice** (`pick_keeper()` inside `find_duplicates()`): was oldest
+  date → largest file. Now highest resolution (`PhotoRecord.pixels`, from
+  `get_pixel_count()`) → has a real, non-suspicious EXIF date → largest file
+  → oldest date. The old order let a downscaled, EXIF-stripped copy dated
+  from its filename (midnight) beat the full-resolution original's EXIF
+  timestamp from later the same day. Exact-hash groups are unaffected (the
+  first three keys are identical there, so date still decides).
+- **Video UTC → local** (`utc_to_local()`, `VIDEO_UTC_METADATA_EXTENSIONS`):
+  MP4/MOV/M4V/3GP (`mvhd`), MKV/WebM (`DateUTC`) and WMV (ASF file
+  properties) creation dates are UTC by spec, and hachoir returns them naive
+  — verified in hachoir's source (`metadata/video.py`). They're now converted
+  to this machine's local zone before the suspicious-date check, so videos
+  match photos' camera-local EXIF dates. AVI/FLV left as-is (no UTC
+  guarantee; AVI's IDIT is a local-time string). Uses the *machine's* zone,
+  not the zone where the clip was shot. Some non-phone cameras wrongly
+  write local time into `mvhd`; those will now be off by the UTC offset.
+- **RAW = originals, never duplicates** (user's call): `RAW_EXTENSIONS` /
+  `is_raw()`. `process_photo()` skips hashing for RAW exactly like videos
+  (so `find_duplicates()` never sees them, and a camera JPEG can't be
+  marked a duplicate of its RAW or vice versa), and `destination_path()`
+  puts them in `organized/YYYY/MM/originals/` (`unknown_date/originals/`
+  if undated). Layout stays year/month. The user's example was a day-level
+  path, but asked, they chose to keep YYYY/MM.
+  - Found while doing this: `get_photo_date()` only read EXIF from
+    `img.info["exif"]`, which Pillow never sets for TIFF containers, so
+    NEF/CR2/DNG/ARW/PEF/SRW (and `.tif`) never got EXIF dates. They fell
+    back to filename/filesystem, which could split a RAW from its JPEG
+    across months. Fixed with an `img.getexif()` fallback. CR3/RAF/ORF/RW2
+    aren't TIFF and still can't be opened by Pillow at all.
+- **TIFF joined RAW as an "original"** (same day, user request: a trip shot
+  as NEF + JPEG + TIF, and the TIF must never be set aside as a duplicate).
+  `ORIGINAL_EXTENSIONS = RAW_EXTENSIONS | {'.tif', '.tiff'}` and
+  `is_original()` (which replaced `is_raw()`) drive both the no-hashing skip
+  and the `originals/` placement. Tradeoff: duplicate TIFFs (e.g. a scan
+  saved twice) are never caught, and a lone TIF with no matching JPEG still
+  lands in `originals/` rather than the month folder itself.
+
 ## Remaining known tradeoffs (not bugs)
 
 - Videos are never deduplicated by design (see above) — genuinely duplicate
   video files (e.g. the same clip backed up twice) will both land in
-  `organized/`, unlike photos. Not a bug; revisit only if asked.
+  `organized/`, unlike photos. Not a bug; revisit only if asked. Same for
+  RAW and TIFF files (2026-10-24, user's call): identical copies both land
+  in `originals/` (`safe_copy()` suffixes the second `_1`).
 - Broad `except Exception: pass` blocks throughout intentionally keep a single
   bad file from crashing the whole run — expected tradeoff for this tool, not
   something to "fix" reflexively.

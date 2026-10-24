@@ -19,8 +19,8 @@ Scans tens of thousands of photos (and videos), removes near-duplicates, and org
    - Videos use the same filename/file-system tiers (no EXIF step — see below)
 4. **Flags suspicious dates** — years outside 1990–present are noted in the report
 5. **Detects duplicates** using perceptual hashing (very strict: catches re-saves, crops, minor edits) — **photos only**, see below
-6. **Keeps the oldest copy** when duplicates are found
-7. **Copies** organized photos and videos to `output/organized/YYYY/MM/`, together by date
+6. **Keeps the best-quality copy** when duplicates are found — highest resolution, then one with a real EXIF date, then largest file, then oldest date
+7. **Copies** organized photos and videos to `output/organized/YYYY/MM/`, together by date — camera RAW files (NEF, CR2, DNG, ...) and TIFFs go into an `originals/` subfolder there and are never treated as duplicates
 8. **Copies duplicates** to `output/duplicates/` for your review
 9. **Generates an HTML report** with all actions, suspicious dates, and duplicate groups
 10. **Optionally archives `--source`** into chunked, verified zip files after a
@@ -44,13 +44,28 @@ Download from: https://www.python.org/downloads/
 Running on an older interpreter exits immediately with a clear message rather
 than failing partway through a run.
 
-### Install Dependencies
+### Install Dependencies (in a virtual environment)
 
-Open Command Prompt and run:
+Install into a project-local virtual environment (`.venv\`, already in
+`.gitignore`) so these packages don't mix with other Python projects. On
+Windows, from the project folder in PowerShell:
 
 ```
+py -3.15 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
+
+(Any supported version works in place of `-3.15`; `py -0` lists the ones
+installed. In Command Prompt, activate with `.venv\Scripts\activate.bat`
+instead. If PowerShell refuses to run `Activate.ps1`, run
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once.)
+
+Activate it again in each new terminal before running the tool. Once it's
+active, `python` means the venv's Python, so the commands below work as
+written. On macOS/Linux, create it with `python3 -m venv .venv` and activate
+it with `source .venv/bin/activate`.
 
 This installs Pillow, piexif, imagehash, tqdm, colorama, pillow-heif (needed
 for iPhone HEIC photos — without it, HEIC files are scanned but skipped), and
@@ -106,7 +121,10 @@ C:\Photos\Organized\
 │   ├── 2018\
 │   │   ├── 06\
 │   │   │   ├── IMG_1234.jpg
-│   │   │   └── DSC_0042.jpg
+│   │   │   ├── DSC_0042.jpg
+│   │   │   └── originals\  ← camera RAW + TIFF files (never deduplicated)
+│   │   │       ├── DSC_0042.NEF
+│   │   │       └── DSC_0042.tif
 │   │   └── 12\
 │   ├── 2019\
 │   └── unknown_date\       ← photos with no usable date
@@ -221,6 +239,10 @@ folder. Two differences from photo handling:
   Priority is: container metadata → filename pattern (e.g.
   `VID_20190704_120000.mp4`) → file system date. If `hachoir` isn't installed,
   the tool warns once at startup and falls back to filename/filesystem only.
+  MP4/MOV/M4V/3GP, MKV/WebM and WMV store that time in **UTC**, so it's
+  converted to this computer's local time zone — otherwise an evening clip
+  near the end of a month could land in the next month's folder, away from
+  the photos taken alongside it. AVI/FLV/MPEG dates are used as-is.
 - **No deduplication**: videos are never hashed and never compared for
   duplicates — they always land in `organized/`, never `duplicates/`. If you
   have genuinely duplicate video files, this tool won't catch them.
@@ -272,6 +294,8 @@ and either wait for background sync to finish or right-click the folder →
 
 ## Running Tests
 
+With the virtual environment active (see Install Dependencies):
+
 ```
 pip install -r requirements-dev.txt
 pytest tests/
@@ -298,7 +322,9 @@ pip-audit -r requirements.txt
 
 ## Supported Formats
 
-**Photos** (dated, deduplicated): JPG, JPEG, PNG, GIF, BMP, TIFF/TIF, WebP, HEIC/HEIF (with pillow-heif), and RAW formats: CR2, CR3, NEF, ARW, ORF, RW2, DNG, RAF, PEF, SRW, RAW
+**Photos** (dated, deduplicated): JPG, JPEG, PNG, GIF, BMP, WebP, HEIC/HEIF (with pillow-heif)
+
+**Originals: camera RAW and TIFF** (dated, *not* deduplicated, copied to `YYYY/MM/originals/`): CR2, CR3, NEF, ARW, ORF, RW2, DNG, RAF, PEF, SRW, RAW, TIFF/TIF. EXIF dates are read from TIFF files and the TIFF-based RAW formats (NEF, CR2, DNG, ARW, PEF, SRW); CR3, RAF, ORF and RW2 aren't TIFF files, so they're dated from filename → file system date instead. Because TIFFs are never compared, duplicate TIFFs (e.g. the same scan saved twice) are both kept
 
 **Videos** (dated, *not* deduplicated — see [Video Handling](#video-handling)): MP4, MOV, AVI, MPG, MPEG, M4V, WMV, 3GP, MKV, FLV, WebM
 

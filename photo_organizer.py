@@ -4,11 +4,15 @@ Photo Organizer & Deduplicator
 - Scans a source folder recursively for images and videos
 - Reads EXIF DateTimeOriginal (most trustworthy) with fallbacks
 - Detects visually similar images using perceptual hashing (very strict mode)
-- Keeps the copy with the oldest EXIF date when duplicates are found
+- Keeps the best-quality copy (highest resolution, then real EXIF, then
+  largest file, then oldest date) when duplicates are found
 - Copies organized photos to a new folder structure: YYYY/MM/
-- Videos are dated from container metadata (creation time — most trustworthy)
-  with filename/filesystem fallbacks, and copied into the same YYYY/MM/ folder
-  as photos, but are never deduplicated
+- Camera RAW files (NEF, CR2, DNG, ...) and TIFFs are never deduplicated and
+  go into YYYY/MM/originals/
+- Videos are dated from container metadata (creation time, converted from
+  UTC to local time — most trustworthy) with filename/filesystem fallbacks,
+  and copied into the same YYYY/MM/ folder as photos, but are never
+  deduplicated
 - Moves suspected duplicates to a separate review folder
 - Generates a detailed HTML report of all actions
 
@@ -51,7 +55,7 @@ import re
 import warnings
 import zipfile
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -111,11 +115,21 @@ except ImportError:
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-SUPPORTED_PHOTO_EXTENSIONS = {
-    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
-    '.webp', '.heic', '.heif', '.cr2', '.cr3', '.nef', '.arw',
-    '.orf', '.rw2', '.dng', '.raf', '.pef', '.srw', '.raw'
+RAW_EXTENSIONS = {
+    '.cr2', '.cr3', '.nef', '.arw', '.orf', '.rw2', '.dng', '.raf',
+    '.pef', '.srw', '.raw'
 }
+
+# Camera RAW plus TIFF (typically a full-quality master or export kept
+# alongside a RAW+JPEG pair). These are originals, never duplicates: they're
+# never hashed (so find_duplicates() never sees them, same as videos) and are
+# copied into an originals/ subfolder of their YYYY/MM folder, beside the
+# JPEGs shot alongside them — see process_photo() and destination_path().
+ORIGINAL_EXTENSIONS = RAW_EXTENSIONS | {'.tif', '.tiff'}
+
+SUPPORTED_PHOTO_EXTENSIONS = {
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif'
+} | ORIGINAL_EXTENSIONS
 
 # The only Pillow decoders Image.open() may use. Pillow picks a decoder by
 # sniffing file contents, not the extension, so without this a file named
@@ -136,9 +150,22 @@ SUPPORTED_VIDEO_EXTENSIONS = {
 }
 
 
+# Containers whose creation date is defined as UTC by their own spec
+# (QuickTime/MP4 `mvhd`, Matroska `DateUTC`, ASF file properties). hachoir
+# returns it as a naive datetime, so get_video_date() converts it to local
+# time to match photos, whose EXIF dates are camera-local. AVI/FLV/MPEG dates
+# have no such guarantee and are left as-is.
+VIDEO_UTC_METADATA_EXTENSIONS = {'.mp4', '.mov', '.m4v', '.3gp', '.mkv', '.webm', '.wmv'}
+
+
 def is_video(path: Path) -> bool:
     """True if `path`'s extension is a supported video format."""
     return path.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS
+
+
+def is_original(path: Path) -> bool:
+    """True if `path` is a camera RAW or TIFF file (see ORIGINAL_EXTENSIONS)."""
+    return path.suffix.lower() in ORIGINAL_EXTENSIONS
 
 # Suspicious year range — flag dates outside this as potentially wrong
 MIN_VALID_YEAR = 1990
@@ -191,6 +218,7 @@ class PhotoRecord:
     date_source: str = "error"
     file_hash: Optional[str] = None
     phash: Optional[str] = None
+    pixels: int = 0  # width x height; 0 if unknown (videos, RAW, unreadable)
     error: Optional[str] = None
     cloud_only: bool = False
 
@@ -281,20 +309,27 @@ def get_photo_date(path: Path) -> tuple[Optional[datetime], str]:
                     exif = piexif.load(exif_bytes)
                 except Exception:
                     exif = {}
-                exif_map = [
-                    (piexif.ExifIFD.DateTimeOriginal,  exif.get("Exif", {}), "EXIF:DateTimeOriginal"),
-                    (piexif.ExifIFD.DateTimeDigitized, exif.get("Exif", {}), "EXIF:DateTimeDigitized"),
-                    (piexif.ImageIFD.DateTime,          exif.get("0th",  {}), "EXIF:DateTime"),
-                ]
-                for tag, ifd, label in exif_map:
-                    raw = ifd.get(tag)
-                    if raw:
-                        val = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw)
-                        candidate = parse_exif_date(val)
-                        if candidate and not is_date_suspicious(candidate):
-                            return candidate, label
-                        elif candidate and dt is None:
-                            dt, source = candidate, label  # store even if suspicious
+                exif_ifd, zeroth_ifd = exif.get("Exif", {}), exif.get("0th", {})
+            else:
+                # TIFF-based files (.tif and most RAW formats: NEF, CR2, DNG,
+                # ARW, ...) store EXIF as TIFF tags, not as an "exif" blob in
+                # img.info — without this they'd never get an EXIF date.
+                tags = img.getexif()
+                exif_ifd, zeroth_ifd = tags.get_ifd(0x8769), dict(tags)
+            exif_map = [
+                (piexif.ExifIFD.DateTimeOriginal,  exif_ifd,   "EXIF:DateTimeOriginal"),
+                (piexif.ExifIFD.DateTimeDigitized, exif_ifd,   "EXIF:DateTimeDigitized"),
+                (piexif.ImageIFD.DateTime,          zeroth_ifd, "EXIF:DateTime"),
+            ]
+            for tag, ifd, label in exif_map:
+                raw = ifd.get(tag)
+                if raw:
+                    val = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw)
+                    candidate = parse_exif_date(val)
+                    if candidate and not is_date_suspicious(candidate):
+                        return candidate, label
+                    elif candidate and dt is None:
+                        dt, source = candidate, label  # store even if suspicious
     except UnidentifiedImageError:
         # Not an image we can open — fall through to other strategies
         pass
@@ -327,6 +362,18 @@ def get_photo_date(path: Path) -> tuple[Optional[datetime], str]:
     return None, "no date found"
 
 
+def utc_to_local(dt: datetime, tz: Optional[tzinfo] = None) -> datetime:
+    """
+    Convert a naive UTC datetime to naive local time (this machine's time zone
+    unless `tz` is given). Returns `dt` unchanged if the platform can't
+    convert it (e.g. Windows rejects pre-1970 timestamps).
+    """
+    try:
+        return dt.replace(tzinfo=timezone.utc).astimezone(tz).replace(tzinfo=None)
+    except (OverflowError, OSError, ValueError):
+        return dt
+
+
 def get_video_date(path: Path) -> tuple[Optional[datetime], str]:
     """
     Returns (datetime, source_description) using this priority:
@@ -352,6 +399,8 @@ def get_video_date(path: Path) -> tuple[Optional[datetime], str]:
                     parser.stream.close()
                 candidate = metadata.get("creation_date", None) if metadata else None
                 if isinstance(candidate, datetime):
+                    if path.suffix.lower() in VIDEO_UTC_METADATA_EXTENSIONS:
+                        candidate = utc_to_local(candidate)
                     if not is_date_suspicious(candidate):
                         return candidate, "video metadata"
                     dt, source = candidate, "video metadata"
@@ -402,6 +451,18 @@ def compute_perceptual_hash(path: Path) -> Optional[imagehash.ImageHash]:
             return imagehash.phash(img, hash_size=16)  # larger = more precise
     except Exception:
         return None
+
+
+def get_pixel_count(path: Path) -> int:
+    """
+    Width x height in pixels, or 0 if the image can't be opened. The main
+    quality signal when find_duplicates() picks which look-alike to keep.
+    """
+    try:
+        with Image.open(path, formats=PILLOW_OPEN_FORMATS) as img:
+            return img.width * img.height
+    except Exception:
+        return 0
 
 
 def safe_copy(src: Path, candidate: Path) -> tuple[Optional[Path], Optional[str]]:
@@ -506,13 +567,15 @@ def process_photo(path: Path, hydrate: bool = False) -> PhotoRecord:
         record.date = dt
         record.date_source = source
 
-        # Videos are organized by date like photos, but never deduplicated:
-        # leaving file_hash/phash unset means find_duplicates() (which only
-        # groups records with a truthy hash) simply never considers them.
-        if not video:
+        # Videos and originals (RAW/TIFF) are organized by date like photos,
+        # but never deduplicated: leaving file_hash/phash unset means
+        # find_duplicates() (which only groups records with a truthy hash)
+        # simply never considers them.
+        if not (video or is_original(path)):
             record.file_hash = compute_file_hash(path)
             ph = compute_perceptual_hash(path)
             record.phash = str(ph) if ph else None
+            record.pixels = get_pixel_count(path)
 
     except Exception as e:
         record.error = str(e)
@@ -588,7 +651,7 @@ def find_duplicates(photos: list[PhotoRecord], hash_threshold: int) -> dict[str,
       1. Exact match (same file hash) → definite duplicates
       2. Perceptual hash within threshold → visual duplicates
 
-    Within each group, keep the photo with the OLDEST date.
+    Within each group, keep the best-quality copy (see pick_keeper()).
     """
     print(f"\n{Fore.CYAN}Grouping duplicates...")
 
@@ -655,12 +718,22 @@ def find_duplicates(photos: list[PhotoRecord], hash_threshold: int) -> dict[str,
     photo_index = {p.path: p for p in photos}
 
     def pick_keeper(paths: list[str]) -> str:
-        """Pick the photo with the oldest valid date; fall back to largest file."""
+        """
+        Pick the best-quality copy: highest resolution, then one with a real
+        EXIF date, then largest file, then oldest date. Date comes last
+        because it says nothing about quality — a downscaled copy whose date
+        came from its filename (midnight) would otherwise beat the
+        full-resolution original's EXIF timestamp from later that day. For
+        exact-hash groups the first three are identical, so date decides.
+        """
         def sort_key(path):
             p = photo_index.get(path)
-            dt = p.date if p and p.date else datetime.max
+            pixels = p.pixels if p else 0
+            has_exif = bool(p and p.date_source.startswith("EXIF")
+                            and "SUSPICIOUS" not in p.date_source)
             size = p.size if p else 0
-            return (dt, -size)
+            dt = p.date if p and p.date else datetime.max
+            return (-pixels, not has_exif, -size, dt)
         return sorted(paths, key=sort_key)[0]
 
     for group in exact_groups.values():
@@ -686,6 +759,9 @@ def destination_path(photo: PhotoRecord, output_root: Path) -> Path:
         folder = output_root / "organized" / f"{photo.date.year:04d}" / f"{photo.date.month:02d}"
     else:
         folder = output_root / "organized" / "unknown_date"
+
+    if is_original(original):
+        folder = folder / "originals"
 
     # Return base destination (unique name guaranteed by safe_copy at write time)
     return folder / original.name
