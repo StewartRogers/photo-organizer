@@ -1,11 +1,11 @@
 -r requirements.txt
 
-pytest>=8.0.0
+pytest>=9.1.1
 
-# Static check that nothing raises the supported-Python floor above 3.11
+# Static check that nothing raises the supported-Python floor above 3.12
 # (see the version-floor job in .github/workflows/tests.yml).
-vermin>=1.6.0
+vermin>=1.9.2
 
 # Known-vulnerability scan of the installed dependencies (see the audit job
 # in .github/workflows/tests.yml).
-pip-audit>=2.7.0
+pip-audit>=2.10.1

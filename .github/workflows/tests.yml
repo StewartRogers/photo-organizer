@@ -14,7 +14,7 @@ jobs:
       matrix:
         # The supported range declared in photo_organizer.py
         # (PYTHON_MIN_VERSION) and the README.
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.12", "3.13", "3.14", "3.15"]
 
     name: py${{ matrix.python-version }}
     steps:
@@ -30,8 +30,8 @@ jobs:
           pip install -r requirements-dev.txt
 
       # Catches the failure mode that motivated this matrix: syntax that
-      # parses on a newer interpreter but not an older one (e.g. backslashes
-      # in f-string expressions, legal only from 3.12).
+      # parses on a newer interpreter but not an older one (e.g. 3.14's
+      # t-strings or unparenthesized `except A, B:`).
       - name: Byte-compile
         run: python -m compileall -q photo_organizer.py tests/
 
@@ -53,10 +53,10 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install vermin
-      # Fails if anything raises the floor above 3.11 (the trailing "-" means
-      # "must run on 3.11 or older"). Static gate; the matrix job above is the
+      # Fails if anything raises the floor above 3.12 (the trailing "-" means
+      # "must run on 3.12 or older"). Static gate; the matrix job above is the
       # runtime one -- vermin cannot see generics used outside annotations.
-      - run: vermin --target=3.11- --no-tips photo_organizer.py tests/
+      - run: vermin --target=3.12- --no-tips photo_organizer.py tests/
 
   audit:
     runs-on: ubuntu-latest

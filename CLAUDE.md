@@ -10,34 +10,40 @@ HTML report at the end.
 
 ## Layout
 
-- `photo_organizer.py` — the tool (~950 lines). Photos/videos are passed around
+- `photo_organizer.py` — the tool (~1,350 lines). Photos/videos are passed around
   as a `PhotoRecord` dataclass (`path`, `size`, `date`, `date_source`,
   `file_hash`, `phash`, `error`, `cloud_only`); pipeline results use an
   `OrganizeResults` dataclass.
-- `tests/test_photo_organizer.py` — pytest suite covering date parsing,
-  `find_duplicates` grouping (including the BK-tree-backed visual clustering),
-  `safe_copy` collision/overwrite handling, symlink skipping in `scan_photos`,
-  `validate_paths`, `resolve_log_path`/`setup_logging`, the `errors/`-folder
-  copy path in `organize_photos`, cloud-only-placeholder detection, the
-  `retry_photos_<run_id>.txt` round-trip, and video scanning/dating/no-dedup
-  behavior.
+- `tests/test_photo_organizer.py` — pytest suite (85 tests) covering date
+  parsing, `find_duplicates` grouping (including the BK-tree-backed visual
+  clustering), `safe_copy` collision/overwrite handling, symlink skipping in
+  `scan_photos`, `validate_paths`, `resolve_log_path`/`setup_logging`, the
+  `PILLOW_OPEN_FORMATS` allowlist (EPS-disguised-as-JPG rejection, every
+  allowlisted format still hashing), the report's error-overflow note, the
+  `errors/`-folder copy path in `organize_photos`, cloud-only-placeholder
+  detection and hydration, the `retry_photos_<run_id>.txt` round-trip, the
+  disk-space and cloud-only-backlog pre-flight checks, video
+  scanning/dating/no-dedup behavior, and `archive_source`/`_verify_zip`
+  chunking and CRC verification.
 - `requirements.txt` / `requirements-dev.txt` — runtime deps (Pillow, piexif,
   imagehash, tqdm, colorama, pillow-heif, hachoir) and dev deps (adds pytest,
   vermin and pip-audit), respectively. Both use **floor pins** (`>=`) with no
-  upper bound: they record the oldest version known to work while still
-  allowing `pip install -U`. Exception: `Pillow>=13.0.0` is a *security*
+  upper bound: they record the versions verified across the supported Python
+  range while still allowing `pip install -U`. Raised to the then-latest
+  releases on 2026-10-24 when 3.15 support was added — older releases of the
+  compiled packages (notably pillow-heif) don't ship 3.15 wheels. Exception: `Pillow>=13.0.0` is a *security*
   floor (see the 2026-10-23 section below) — don't lower it for
   compatibility. numpy/scipy/PyWavelets are transitive via imagehash and
   intentionally unlisted. No other build/lint config — plain `python3
   photo_organizer.py ...`; tests via `pytest tests/` (`pip install -r
   requirements-dev.txt` first).
 - `.github/workflows/tests.yml` — CI. A `test` matrix job byte-compiles,
-  imports, smoke-tests `--help`, and runs pytest on Python 3.11/3.12;
-  a separate `version-floor` job runs `vermin --target=3.11-` as a static gate.
+  imports, smoke-tests `--help`, and runs pytest on Python 3.12/3.13/3.14/3.15;
+  a separate `version-floor` job runs `vermin --target=3.12-` as a static gate.
   The two are complementary: vermin catches version-only *syntax* without
   needing old interpreters installed, but is blind to generics used outside
   annotations (e.g. `isinstance(v, int | str)`) — the matrix job catches those
-  by actually importing on 3.11. A third `audit` job runs `pip-audit -r
+  by actually importing on 3.12. A third `audit` job runs `pip-audit -r
   requirements.txt` and fails on any dependency with a published advisory —
   it can go red with no code change when a new advisory lands; that's
   intended.
@@ -127,7 +133,7 @@ HTML report at the end.
 - `archive_source()` / `_verify_zip()` — optional post-run step
   (`--archive-source`, opt-in): walks `--source` (skipping symlinks and its
   own prior `archive_*.zip` output) and greedily packs files into
-  `~--archive-chunk-gb`-sized `ZIP_STORED` chunks written into `--source`'s
+  `--archive-chunk-gb`-sized `ZIP_STORED` chunks written into `--source`'s
   own root. Never splits a single file across chunks. Each finished chunk is
   verified immediately via `zipfile.testzip()` (CRC check, not just "does it
   open") in `_verify_zip()`; failures are collected and reported rather than
@@ -325,11 +331,19 @@ prior clean run, since there's no `results` object in this code path at all
 
 ## Python version support
 
-Supported range is **3.11 - 3.12**, declared in three places that must stay
+Supported range is **3.12 - 3.15**, declared in three places that must stay
 in sync: `PYTHON_MIN_VERSION` in `photo_organizer.py`, the CI matrix in
 `.github/workflows/tests.yml`, and the README's Requirements section (plus the
-vermin `--target` in CI and the README). It was 3.9 - 3.12 until 2026-10-23;
-raised because the patched Pillow (13.0.0) requires 3.11+ — see below.
+vermin `--target` in CI and the README). History: 3.9 - 3.12 until
+2026-10-23, then 3.11 - 3.12 (the patched Pillow 13.0.0 requires 3.11+ — see
+below), then 3.12 - 3.15 from 2026-10-24 (user request: the dev machine has
+only 3.14/3.15 installed; 3.11 dropped at the same time by user choice). The
+upper end is a *tested* bound, not an enforced one — nothing refuses to run
+on 3.16+, it is just not in the CI matrix.
+
+When 3.15 was added, every dependency already shipped wheels for it (Pillow
+13.0.0, numpy 2.5, scipy 1.18, PyWavelets 1.10, pillow-heif 1.8) and the
+suite passed unchanged on 3.14 and 3.15 — no code changes were needed.
 
 `photo_organizer.py` starts with `from __future__ import annotations` (PEP
 563), which keeps every annotation an unevaluated string. That is what makes

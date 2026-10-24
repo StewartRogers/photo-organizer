@@ -32,11 +32,11 @@ Optional flags:
                        (written to --source's own root; see --archive-chunk-gb)
     --archive-only     Skip scanning/organizing and just archive --source now
 
-Supported Python versions: 3.11 - 3.12 (see PYTHON_MIN_VERSION below).
+Supported Python versions: 3.12 - 3.15 (see PYTHON_MIN_VERSION below).
 """
 
 # Keeps annotations unevaluated (PEP 563). No longer strictly required since
-# the floor moved to 3.11 (PEP 604 `str | None` is native there), but kept so
+# the floor moved past 3.10 (PEP 604 `str | None` is native there), but kept so
 # typing syntax newer than the floor still can't break import on an older
 # supported interpreter.
 from __future__ import annotations
@@ -61,7 +61,7 @@ import time
 # Lowest interpreter this tool is tested against. Checked at import time so an
 # unsupported interpreter produces this message rather than an obscure
 # AttributeError/TypeError from a newer stdlib API deeper into the run.
-PYTHON_MIN_VERSION = (3, 11)
+PYTHON_MIN_VERSION = (3, 12)
 if sys.version_info < PYTHON_MIN_VERSION:
     sys.exit(
         "photo_organizer requires Python "
